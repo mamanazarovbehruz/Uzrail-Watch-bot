@@ -4,8 +4,9 @@ from dotenv import load_dotenv
 import calendar
 from datetime import date, timedelta,datetime
 from fetcher import fetch_trains, make_summary, search_stations
-from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
-from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters
+from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton
+from pathlib import Path
+from telegram.ext import PicklePersistence, Application, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters
 
 load_dotenv()
 
@@ -21,6 +22,12 @@ DATE = "2026-01-30"
 STATE_FILE = f"state_{DEP}_{ARV}_{DATE}.json"
 
 STATIONS = ["Toshkent", "Samarqand", "Buxoro", "Andijon", "Termiz", "Qo‘qon"]
+
+PHONE_KB = ReplyKeyboardMarkup(
+    [[KeyboardButton("📱 Telefon raqamni yuborish", request_contact=True)]],
+    resize_keyboard=True,
+    one_time_keyboard=True,
+)
 
 MAIN_KB = ReplyKeyboardMarkup(
     [["📍 Yo'nalishni kiritish"]],
@@ -245,7 +252,7 @@ def _watch_day_report(old_api: dict, new_api: dict) -> str:
 
             sign = ""
             if delta != 0:
-                sign = f"(+{delta})" if delta > 0 else f"({delta})"
+                sign = f"(➕{delta})" if delta > 0 else f"(➖{(-1)*delta})"
 
             if is_sv or is_umumiy:
                 # SV: faqat son
@@ -416,12 +423,54 @@ async def check_and_notify(app: Application, chat_id: int):
         await app.bot.send_message(chat_id=chat_id, text=msg[:3500])
 
 async def start(update, context):
-    text = (
-        "Salom, Birodar!\n"
-        "Men O‘zbekiston temir yo‘l poyezd chiptalaridagi o‘zgarishlarni kuzataman va sizga habar beraman.\n\n"
-        "Yo‘nalishni tanlang 👇"
+    # ✅ avval ro‘yxatdan o‘tgan bo‘lsa, telefon so‘ramaydi
+    if context.user_data.get("phone"):
+        first = (update.effective_user.first_name or "Birodar").strip()
+        await update.effective_message.reply_text(
+            f"Salom, {first}!\n"
+            "Men O‘zbekiston temir yo‘l poyezd chiptalaridagi o‘zgarishlarni kuzataman va sizga habar beraman.\n\n"
+            "Yo‘nalishni tanlang 👇",
+            reply_markup=MAIN_KB
+        )
+        return
+
+    # ❗️ birinchi marta
+    await update.effective_message.reply_text("Poyezd Chiptalari Kuzatuvchi botiga xush kelibsiz!")
+    await update.effective_message.reply_text(
+        "📱 Iltimos, telefon raqamingizni yuboring yoki tugmadan foydalaning.",
+        reply_markup=PHONE_KB
     )
-    await update.effective_message.reply_text(text, reply_markup=MAIN_KB)
+
+
+def _need_phone(context) -> bool:
+    return not context.user_data.get("phone")
+
+
+async def phone_contact_handler(update, context):
+    contact = update.effective_message.contact
+    if not contact or not contact.phone_number:
+        await update.effective_message.reply_text(
+            "📱 Iltimos, pastdagi tugma orqali telefon raqamingizni yuboring.",
+            reply_markup=PHONE_KB
+        )
+        return
+
+    # ✅ shu 2 qator eng muhim
+    context.user_data["phone"] = contact.phone_number
+    context.user_data["registered"] = True
+
+    await update.effective_message.reply_text(
+        "Telefon raqamingiz qabul qilindi ✅",
+        reply_markup=ReplyKeyboardRemove()
+    )
+
+    first = (update.effective_user.first_name or "Birodar").strip()
+    await update.effective_message.reply_text(
+        f"Salom, {first}!\n"
+        "Men O‘zbekiston temir yo‘l poyezd chiptalaridagi o‘zgarishlarni kuzataman va sizga habar beraman.\n\n"
+        "Yo‘nalishni tanlang 👇",
+        reply_markup=MAIN_KB
+    )
 
 
 async def watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -446,6 +495,12 @@ async def watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def start_route(update, context):
+    if _need_phone(context):
+        await update.effective_message.reply_text(
+            "📱 Avval telefon raqamingizni yuboring.",
+            reply_markup=PHONE_KB
+        )
+        return
     context.user_data.clear()
     context.user_data["step"] = "dep_query"
 
@@ -899,6 +954,12 @@ async def calendar_handler(update, context):
             return
 
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # if _need_phone(context):
+    #     await update.effective_message.reply_text(
+    #         "📱 Avval telefon raqamingizni yuboring.",
+    #         reply_markup=PHONE_KB
+    #     )
+    #     return
     chat_id = update.effective_chat.id
 
     watch_chats = context.application.bot_data.get("watch_chats", {})
@@ -976,16 +1037,27 @@ async def route_button_router(update, context):
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN .env ichida yo'q yoki bo'sh")
+    
+    base_dir = Path(__file__).resolve().parent
+    pkl_path = base_dir / "bot_data.pkl"
+    
+    persistence = PicklePersistence(filepath="bot_data.pkl")  # ✅ shu faylga saqlanadi
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .persistence(persistence)   # ✅ MUHIM
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("watch", watch))
-    app.add_handler(CommandHandler("stop", stop))
-    app.add_handler(CommandHandler("now", now))
+    app.add_handler(MessageHandler(filters.CONTACT, phone_contact_handler))
     app.add_handler(MessageHandler(filters.Regex(r"^📍 Yo'nalishni kiritish$"), start_route))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, flow_handler))
     app.add_handler(MessageHandler(filters.Regex(r"^🔙 Orqaga$"), back_to_main))
+    app.add_handler(CommandHandler("watch", watch))
+    app.add_handler(CommandHandler("stop", stop))
+    app.add_handler(CommandHandler("now", now))
     app.add_handler(CallbackQueryHandler(inline_button_handler, pattern=r"^empty$"))
 
     # JobQueue PTB ichida ishlaydi (event loop muammosiz)
@@ -1004,7 +1076,21 @@ async def inline_button_handler(update, context):
         await query.edit_message_text("Hozircha bu tugma bo‘sh 🙂")
 
 async def flow_handler(update, context):
+    # # Registratsiya tugamaguncha hamma narsa blok
+    # if _need_phone(context):
+    #     await update.effective_message.reply_text(
+    #         "📱 Iltimos, telefon raqamingizni yuboring (pastdagi tugma orqali) 👇",
+    #         reply_markup=PHONE_KB
+    #     )
+    #     return
     step = context.user_data.get("step")
+    # Registratsiya tugamaguncha boshqa narsaga o'tkazmaymiz
+    if step == "need_phone":
+        await update.effective_message.reply_text(
+            "📱 Iltimos, telefon raqamingizni tugma orqali yuboring 👇",
+            reply_markup=PHONE_KB
+        )
+        return
     text = (update.message.text or "").strip()
 
     # Orqaga
@@ -1405,7 +1491,7 @@ async def watcher_job(context):
             )
 
             for d in changed_days:
-                text += f"\n📅 {fmt_date(d)}\n"
+                text += f"\n\n📅 {fmt_date(d)}\n"
                 old_api = old_snapshot.get(d, {})
                 new_api = new_snapshot.get(d, {})
                 text += _watch_day_report(old_api, new_api)
