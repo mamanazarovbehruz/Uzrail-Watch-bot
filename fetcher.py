@@ -4,6 +4,7 @@ import asyncio
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright
 import json
+from urllib.parse import unquote
 
 load_dotenv()
 
@@ -111,83 +112,117 @@ async def _fetch_trains_manual(depStationCode: str, arvStationCode: str, date_is
         return r.json()
 
 async def _fetch_trains_auto(depStationCode: str, arvStationCode: str, date_iso: str) -> dict:
-    """
-    Playwright orqali: brauzer cookie/xsrf oladi va API chaqiradi.
-    """
     payload = {
         "directions": {
             "forward": {
                 "date": date_iso,
-                "depStationCode": depStationCode,
-                "arvStationCode": arvStationCode
+                "depStationCode": str(depStationCode),
+                "arvStationCode": str(arvStationCode)
             }
         }
     }
 
+    # Retry sozlamalari
+    max_tries = int(os.getenv("HTTP_MAX_RETRIES", "3") or "3")
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
 
+        # ENGLISH home ko'proq stabil bo'ladi
         context = await browser.new_context(
             extra_http_headers={
-                "Accept": "application/json",
-                "Accept-Language": "uz",
+                "Accept": "application/json, text/plain, */*",
+                "Accept-Language": "en-US,en;q=0.9,ru;q=0.8,uz;q=0.7",
                 "Origin": BASE,
-                "Referer": f"{BASE}/uz/home",
-                "device-type": "BROWSER",
-                "User-Agent": "Mozilla/5.0",
+                "Referer": f"{BASE}/en/home",
+                "device-type": "web",
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                ),
             }
         )
 
         page = await context.new_page()
 
-        # 1) Home -> cookie/session
-        await page.goto(f"{BASE}/uz/home", wait_until="domcontentloaded")
+        last_text = ""
+        for attempt in range(1, max_tries + 1):
+            # 1) Home -> session cookie
+            await page.goto(f"{BASE}/en/home", wait_until="domcontentloaded")
 
-        # 2) CSRF endpoint -> XSRF-TOKEN cookie ni chiqaradi
-        await context.request.get(f"{BASE}/api/v1/csrf-token")
+            # 2) CSRF endpoint -> XSRF-TOKEN cookie
+            await context.request.get(CSRF_URL)
 
-        # 3) Cookie ichidan XSRF-TOKEN ni olamiz
-        cookies = await context.cookies()
-        xsrf = ""
-        for c in cookies:
-            if c.get("name") == "XSRF-TOKEN":
-                xsrf = c.get("value") or ""
-                break
+            # 3) Cookie ichidan XSRF-TOKEN ni olamiz (URL-encoded bo'lishi mumkin)
+            cookies = await context.cookies()
+            xsrf = ""
+            for c in cookies:
+                if c.get("name") == "XSRF-TOKEN":
+                    xsrf = c.get("value") or ""
+                    break
 
-        if not xsrf:
+            xsrf = unquote(xsrf)  # <<< MUHIM
+
+            if not xsrf:
+                last_text = "XSRF-TOKEN cookie topilmadi."
+                await asyncio.sleep(0.6 * attempt)
+                continue
+
+            headers = {
+                "Accept": "application/json, text/plain, */*",
+                "Accept-Language": "en-US,en;q=0.9,ru;q=0.8,uz;q=0.7",
+                "Content-Type": "application/json",
+                "Origin": BASE,
+                "Referer": f"{BASE}/en/home",
+                "device-type": "web",
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                ),
+                "X-XSRF-TOKEN": xsrf,
+            }
+
+            body = json.dumps(payload)
+            resp = await context.request.post(ENDPOINT, headers=headers, data=body)
+
+            if resp.status == 200:
+                data = await resp.json()
+                await browser.close()
+                return data
+
+            last_text = (await resp.text())[:300]
+
+            # 400/401/403/419 -> odatda sessiya/csrf "sinadi", retry qilamiz
+            if resp.status in (400, 401, 403, 419):
+                await asyncio.sleep(0.8 * attempt)
+                continue
+
             await browser.close()
-            raise RuntimeError("XSRF-TOKEN cookie topilmadi (csrf-token chaqirildi, lekin token kelmadi).")
+            raise RuntimeError(f"API status={resp.status}. Body: {last_text}")
 
-        headers = {
-            "Accept": "application/json",
-            "Accept-Language": "uz",
-            "Content-Type": "application/json",
-            "Origin": BASE,
-            "Referer": f"{BASE}/uz/home",
-            "device-type": "BROWSER",
-            "User-Agent": "Mozilla/5.0",
-            "X-XSRF-TOKEN": xsrf,
-        }
-
-        # 4) MUHIM: Playwright requestda `json=` ishlatmaymiz, data=json.dumps(...) qilamiz
-        body = json.dumps(payload)
-        resp = await context.request.post(ENDPOINT, headers=headers, data=body)
-
-        if resp.status != 200:
-            text = await resp.text()
-            await browser.close()
-            raise RuntimeError(f"API status={resp.status}. Body: {text[:300]}")
-
-        data = await resp.json()
         await browser.close()
-        return data
+        raise RuntimeError(f"API failed after {max_tries} retries. Last body: {last_text}")
 
+async def fetch_trains(depStationCode, arvStationCode, date_iso):
+    # 1) avval MANUAL urinamiz (eng stabil)
+    try:
+        return await _fetch_trains_manual(depStationCode, arvStationCode, date_iso)
+    except RuntimeError as e:
+        msg = str(e)
+        # 400/401/403/419 bo'lsa cookie eskirgan bo'lishi mumkin
+        if any(x in msg for x in ["API status=400", "API status=401", "API status=403", "API status=419"]):
+            # 2) cookie yangilab, yana bir marta urinib ko'ramiz
+            new_cookie, new_xsrf = await refresh_cookie_via_playwright(max_tries=3)
 
-async def fetch_trains(depStationCode: str, arvStationCode: str, date_iso: str) -> dict:
-    if AUTO_COOKIE:
-        return await _fetch_trains_auto(depStationCode, arvStationCode, date_iso)
-    return await _fetch_trains_manual(depStationCode, arvStationCode, date_iso)
+            # global/env o'rniga runtime-da ishlatamiz:
+            os.environ["COOKIE"] = new_cookie
+            os.environ["XSRF_TOKEN"] = new_xsrf
 
+            return await _fetch_trains_manual(depStationCode, arvStationCode, date_iso)
+
+        raise
 
 
 async def _fetch_json_auto(url: str, method: str = "GET", payload: dict | None = None):
@@ -283,3 +318,44 @@ async def search_stations(name: str) -> list[dict]:
             if "code" in s and "name" in s:
                 out.append({"code": str(s["code"]), "name": str(s["name"])})
         return out
+
+
+async def refresh_cookie_via_playwright(max_tries: int = 3) -> tuple[str, str]:
+    """
+    returns: (COOKIE_HEADER, XSRF_TOKEN)
+    """
+    last_err = None
+    for attempt in range(1, max_tries + 1):
+        try:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True)
+                context = await browser.new_context()
+                page = await context.new_page()
+
+                await page.goto(f"{BASE}/en/home", wait_until="domcontentloaded")
+                # timeout ni oshiramiz
+                await context.request.get(CSRF_URL, timeout=45000)
+
+                cookies = await context.cookies()
+                await browser.close()
+
+            xsrf = ""
+            cookie_parts = []
+            for c in cookies:
+                n = c.get("name")
+                v = c.get("value") or ""
+                if n == "XSRF-TOKEN":
+                    xsrf = unquote(v)
+                cookie_parts.append(f"{n}={v}")
+
+            cookie_header = "; ".join(cookie_parts)
+            if not xsrf or not cookie_header:
+                raise RuntimeError("Playwright cookie refresh: XSRF yoki COOKIE bo'sh chiqdi")
+
+            return cookie_header, xsrf
+
+        except Exception as e:
+            last_err = e
+            await asyncio.sleep(0.8 * attempt)
+
+    raise RuntimeError(f"Playwright cookie refresh failed: {last_err}")

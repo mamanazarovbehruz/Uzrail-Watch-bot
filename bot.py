@@ -1050,6 +1050,11 @@ def main():
         .build()
     )
 
+    async def error_handler(update, context):
+        print("❌ ERROR:", context.error)
+
+    app.add_error_handler(error_handler)
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.CONTACT, phone_contact_handler))
     app.add_handler(MessageHandler(filters.Regex(r"^📍 Yo'nalishni kiritish$"), start_route))
@@ -1474,7 +1479,12 @@ async def watcher_job(context):
         changed_days = []
 
         for d in iter_dates(d_from, d_to):
-            api = await fetch_trains(dep, arv, d)
+            try:
+                api = await fetch_trains(dep, arv, d)
+            except Exception as e:
+                # JobQueue yiqilib ketmasin — keyingi siklda yana urinadi
+                print(f"[watcher_job] fetch_trains error: {e}")
+                continue
             new_snapshot[d] = api
 
             old_api = old_snapshot.get(d)
