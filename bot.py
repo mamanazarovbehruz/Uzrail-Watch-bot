@@ -392,6 +392,8 @@ def build_calendar(year: int, month: int, mode: str) -> InlineKeyboardMarkup:
 
     return InlineKeyboardMarkup(rows)
 
+from telegram import ReplyKeyboardRemove
+from telegram.error import BadRequest
 
 async def send_calendar(update, context, mode: str):
     """
@@ -404,7 +406,20 @@ async def send_calendar(update, context, mode: str):
     caption = "🗓 Boshlanish sanasini tanlang:" if mode == "from" else "🗓 Tugash sanasini tanlang:"
     markup = build_calendar(today.year, today.month, mode)
 
-    # ✅ ENG MUHIMI: caption + kalendar BIRTA xabarda
+    # ✅ 1) Reply keyboardni yashiramiz (xabarni keyin o‘chirib tashlaymiz)
+    try:
+        if update.message:
+            tmp = await update.effective_message.reply_text("…", reply_markup=ReplyKeyboardRemove())
+        else:
+            tmp = await update.callback_query.message.reply_text("…", reply_markup=ReplyKeyboardRemove())
+        try:
+            await tmp.delete()
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    # ✅ 2) Kalendarni chiqaramiz (caption + inline kalendar bitta xabarda)
     if update.message:
         await update.effective_message.reply_text(caption, reply_markup=markup)
     else:
@@ -435,6 +450,10 @@ async def start(update, context):
     if db_phone:
         # cache qilib qo'yamiz (keyingi joylarda qulay)
         context.user_data["phone"] = db_phone
+
+        # ✅ qo‘shiladi
+        reset_flow_keep_phone(context)
+        await clear_watch_everything(context, chat_id)
 
         first = (update.effective_user.first_name or "Birodar").strip()
         await update.effective_message.reply_text(
@@ -473,6 +492,39 @@ def reset_flow_keep_phone(context):
         context.user_data["phone"] = phone
     if registered:
         context.user_data["registered"] = registered
+
+async def clear_watch_everything(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    # 1) DB'dagi watchni butunlay tozalash (endi /now eski oraliqni topolmaydi)
+    await save_watch(DB_PATH, chat_id, {
+        "enabled": False,
+        "dep_code": None,
+        "arv_code": None,
+        "dep_name": None,
+        "arv_name": None,
+        "date_from": None,
+        "date_to": None,
+        "snapshot_json": None,
+        "snapshot_hash": None,
+    })
+
+    # 2) RAM'dagi bot_data ichidan ham o'chirib tashlaymiz (watcher_jobga ham ta'sir qiladi)
+    watch_chats = context.application.bot_data.get("watch_chats", {})
+    if isinstance(watch_chats, dict):
+        watch_chats.pop(chat_id, None)
+        context.application.bot_data["watch_chats"] = watch_chats
+
+    # 3) user_data ichidagi flow/watch kalitlarini ham tozalaymiz (phone qoladi)
+    for k in [
+        "dep_code", "arv_code", "dep", "arv",
+        "dep_name", "arv_name",
+        "date_from", "date_to",
+        "snapshot",
+        "watch_enabled", "watch_dep", "watch_arv", "watch_from", "watch_to",
+        "watch_chat_id",
+        "step",
+    ]:
+        context.user_data.pop(k, None)
+
 
 async def phone_contact_handler(update, context):
     contact = update.effective_message.contact
@@ -534,14 +586,15 @@ async def start_route(update, context):
         reply_markup=ReplyKeyboardRemove()
     )
 
+
 async def back_to_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     reset_flow_keep_phone(context)
 
     if await has_active_watch_db(chat_id):
-        await update.effective_message.reply_text("Menyu 👇", reply_markup=kb_watch_controls())
+        await update.effective_message.reply_text("Bosh sahifa", reply_markup=kb_watch_controls())
     else:
-        await update.effective_message.reply_text("Menyu 👇", reply_markup=kb_route_only())
+        await update.effective_message.reply_text("Bosh sahifa", reply_markup=kb_route_only())
 
 
 def _stations_keyboard(items: list[dict], page: int = 0, per_page: int = 10):
@@ -626,7 +679,6 @@ async def dep_query(update, context):
     text = (update.message.text or "").strip()
 
     if text == "🔙 Orqaga":
-        await back_to_main(update, context)
         return
 
     # qidiruv
@@ -651,7 +703,6 @@ async def dep_select(update, context):
     text = (update.message.text or "").strip()
 
     if text == "🔙 Orqaga":
-        await back_to_main(update, context)
         return
 
     stations = context.user_data.get("dep_candidates") or []
@@ -702,7 +753,6 @@ async def arv_query(update, context):
     text = (update.message.text or "").strip()
 
     if text == "🔙 Orqaga":
-        await back_to_main(update, context)
         return
 
     stations = await search_stations(text)
@@ -730,7 +780,6 @@ async def arv_select(update, context):
     text = (update.message.text or "").strip()
 
     if text == "🔙 Orqaga":
-        await back_to_main(update, context)
         return
 
     stations = context.user_data.get("arv_candidates") or []
@@ -1021,25 +1070,56 @@ async def calendar_handler(update, context):
             return
 
         
-
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-
     chat_id = update.effective_chat.id
 
-    await set_watch_enabled(DB_PATH, chat_id, False)
+    # 1) RAM'dagi (user_data) hammasini tozalaymiz
+    for k in [
+        "dep_code", "arv_code", "dep", "arv",
+        "dep_name", "arv_name",
+        "date_from", "date_to",
+        "snapshot",
+        "watch_enabled", "watch_dep", "watch_arv", "watch_from", "watch_to",
+        "watch_chat_id",
+        "step",
+    ]:
+        context.user_data.pop(k, None)
+
+    # 2) DB'dagi watch holatini BUTUNLAY tozalaymiz (endilikda /now ham ishlamaydi)
+    await save_watch(DB_PATH, chat_id, {
+        "enabled": False,
+        "dep_code": None,
+        "arv_code": None,
+        "dep_name": None,
+        "arv_name": None,
+        "date_from": None,
+        "date_to": None,
+        "snapshot_json": None,
+        "snapshot_hash": None,
+    })
+
     await update.effective_message.reply_text(
-        "⏹ Kuzatish o‘chirildi.",
+        "⏹ Kuzatish to‘xtatildi.\n"
+        "Qaytadan boshlash uchun: 📍 Yo'nalishni kiritish",
         reply_markup=kb_route_only()
     )
+
 
 
 async def now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     w = await get_watch(DB_PATH, chat_id)
 
-    if not w or not w.get("dep_code") or not w.get("arv_code") or not w.get("date_from") or not w.get("date_to"):
+    if (not w) or (not w.get("enabled")):
         await update.effective_message.reply_text(
-            "Hali yo‘nalish/sana tanlanmagan.\n📍 Avval: \"📍 Yo'nalishni kiritish\" qiling."
+            "⛔ Kuzatish yoqilmagan.\n"
+            "📍 Yo'nalishni kiriting."
+        )
+        return
+
+    if not w.get("dep_code") or not w.get("arv_code") or not w.get("date_from") or not w.get("date_to"):
+        await update.effective_message.reply_text(
+            "Sizda yo‘nalish va sana tanlanmagan.\n📍 Yo'nalishni kiriting."
         )
         return
 
@@ -1092,7 +1172,6 @@ async def route_button_router(update, context):
         return
 
     if text == "🔙 Orqaga":
-        await back_to_main(update, context)
         return
 
     # agar hozircha boshqa matn bo'lsa, e'tibor bermaymiz
@@ -1143,7 +1222,7 @@ def main():
     app.add_handler(MessageHandler(filters.Regex(r"^📍 Yo'nalishni kiritish$"), start_route), group=1)
     app.add_handler(MessageHandler(filters.Regex(r"^🔙 Orqaga$"), back_to_main), group=1)
 
-    app.add_handler(CommandHandler("watch", watch), group=1)
+    # app.add_handler(CommandHandler("watch", watch), group=1)
     app.add_handler(CommandHandler("stop", stop), group=1)
     app.add_handler(CommandHandler("now", now), group=1)
 
@@ -1193,7 +1272,6 @@ async def flow_handler(update, context):
 
     # Orqaga
     if text == "🔙 Orqaga":
-        await back_to_main(update, context)
         return
 
     # pagination
