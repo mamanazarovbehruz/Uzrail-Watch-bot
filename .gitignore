@@ -4,3 +4,4 @@ __pycache__/
 .env
 state_*.json
 playwright/.cache/
+bot_data.pkl

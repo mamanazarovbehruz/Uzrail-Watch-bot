@@ -6,12 +6,19 @@ from datetime import date, timedelta,datetime
 from fetcher import fetch_trains, make_summary, search_stations
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton
 from pathlib import Path
-from telegram.ext import PicklePersistence, Application, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters
+from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters
+from db import init_db, upsert_user, touch_last_seen, set_phone, get_phone, save_watch, get_watch, set_watch_enabled, list_all_users, list_enabled_watches
+import asyncio
+from telegram.error import BadRequest
+
+
 
 load_dotenv()
 
+WATCH_SEM = asyncio.Semaphore(3)  # bir vaqtda 3 ta so'rov (ko'paytirsang ham bo'ladi)
 WATCH_CHAT_ID = os.getenv("WATCH_CHAT_ID", "").strip()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+DB_PATH = os.getenv("DB_PATH", "bot.db").strip()
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "120"))
 
 # Hozircha bitta yo'nalish/sana (keyin /add bilan ko'paytiramiz)
@@ -58,10 +65,9 @@ def kb_watch_controls():
         resize_keyboard=True
     )
 
-def has_active_watch(context, chat_id: int) -> bool:
-    chats = context.application.bot_data.get("watch_chats", {})
-    w = chats.get(chat_id) or {}
-    return bool(w.get("enabled"))
+async def has_active_watch_db(chat_id: int) -> bool:
+    w = await get_watch(DB_PATH, chat_id)
+    return bool(w and w.get("enabled"))
 
 
 def fmt_date(s: str) -> str:
@@ -386,6 +392,7 @@ def build_calendar(year: int, month: int, mode: str) -> InlineKeyboardMarkup:
 
     return InlineKeyboardMarkup(rows)
 
+
 async def send_calendar(update, context, mode: str):
     """
     mode: 'from' (boshlanish) yoki 'to' (tugash)
@@ -397,12 +404,10 @@ async def send_calendar(update, context, mode: str):
     caption = "🗓 Boshlanish sanasini tanlang:" if mode == "from" else "🗓 Tugash sanasini tanlang:"
     markup = build_calendar(today.year, today.month, mode)
 
-    # reply keyboard (bekatlar)ni yashirib qo'yamiz
+    # ✅ ENG MUHIMI: caption + kalendar BIRTA xabarda
     if update.message:
-        await update.effective_message.reply_text(caption, reply_markup=ReplyKeyboardRemove())
-        await update.effective_message.reply_text("Kalendar:", reply_markup=markup)
+        await update.effective_message.reply_text(caption, reply_markup=markup)
     else:
-        # callbackdan chaqirilsa
         await update.callback_query.message.reply_text(caption, reply_markup=markup)
 
 
@@ -423,8 +428,14 @@ async def check_and_notify(app: Application, chat_id: int):
         await app.bot.send_message(chat_id=chat_id, text=msg[:3500])
 
 async def start(update, context):
-    # ✅ avval ro‘yxatdan o‘tgan bo‘lsa, telefon so‘ramaydi
-    if context.user_data.get("phone"):
+    chat_id = update.effective_chat.id
+
+    # 0) Avval DB’dan tekshiramiz (restart bo‘lsa ham ishlaydi)
+    db_phone = await get_phone(DB_PATH, chat_id)
+    if db_phone:
+        # cache qilib qo'yamiz (keyingi joylarda qulay)
+        context.user_data["phone"] = db_phone
+
         first = (update.effective_user.first_name or "Birodar").strip()
         await update.effective_message.reply_text(
             f"Salom, {first}!\n"
@@ -434,17 +445,34 @@ async def start(update, context):
         )
         return
 
-    # ❗️ birinchi marta
+    # 1) DB’da ham yo‘q bo‘lsa — birinchi marta (faqat /start’da so‘raydi)
     await update.effective_message.reply_text("Poyezd Chiptalari Kuzatuvchi botiga xush kelibsiz!")
     await update.effective_message.reply_text(
         "📱 Iltimos, telefon raqamingizni yuboring yoki tugmadan foydalaning.",
         reply_markup=PHONE_KB
     )
 
+async def need_phone(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> bool:
+    if context.user_data.get("phone"):
+        return False
+    db_phone = await get_phone(DB_PATH, chat_id)
+    if db_phone:
+        context.user_data["phone"] = db_phone
+        context.user_data["registered"] = True
+        return False
+    return True
 
-def _need_phone(context) -> bool:
-    return not context.user_data.get("phone")
 
+def reset_flow_keep_phone(context):
+    phone = context.user_data.get("phone")
+    registered = context.user_data.get("registered")
+
+    context.user_data.clear()
+
+    if phone:
+        context.user_data["phone"] = phone
+    if registered:
+        context.user_data["registered"] = registered
 
 async def phone_contact_handler(update, context):
     contact = update.effective_message.contact
@@ -455,9 +483,14 @@ async def phone_contact_handler(update, context):
         )
         return
 
-    # ✅ shu 2 qator eng muhim
-    context.user_data["phone"] = contact.phone_number
+    phone = contact.phone_number
+
+    # ✅ 1) context (tezkor cache)
+    context.user_data["phone"] = phone
     context.user_data["registered"] = True
+
+    # ✅ 2) SQLite DB (restartdan keyin ham saqlansin)
+    await set_phone(DB_PATH, update.effective_chat.id, phone)
 
     await update.effective_message.reply_text(
         "Telefon raqamingiz qabul qilindi ✅",
@@ -475,33 +508,25 @@ async def phone_contact_handler(update, context):
 
 async def watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-
-    watch_chats = context.application.bot_data.get("watch_chats", {})
-    if not isinstance(watch_chats, dict):
-        watch_chats = {}
-
-    # Agar avval qidiruv qilingan bo‘lsa, shu chatda data bo‘ladi.
-    # Bo‘lmasa ham enabled qilib qo'yamiz, keyin qidiruvdan keyin to‘liq to‘ldiramiz.
-    w = watch_chats.get(chat_id, {})
-    w["enabled"] = True
-    watch_chats[chat_id] = w
-
-    context.application.bot_data["watch_chats"] = watch_chats
+    await set_watch_enabled(DB_PATH, chat_id, True)
 
     await update.effective_message.reply_text(
         f"✅ Kuzatish yoqildi. Har {POLL_SECONDS} soniyada tekshiraman.\n"
-        "📍 Avval yo‘nalish va sana oralig‘ini tanlang, keyin kuzatish ishlaydi."
+        "📍 Yo‘nalish/sana tanlangan bo‘lsa — avtomatik ishlaydi.\n"
+        "Agar hali tanlanmagan bo‘lsa, qidiruv qiling.",
+        reply_markup=WATCH_KB
     )
 
 
+
 async def start_route(update, context):
-    if _need_phone(context):
+    if await need_phone(context, update.effective_chat.id):
         await update.effective_message.reply_text(
             "📱 Avval telefon raqamingizni yuboring.",
             reply_markup=PHONE_KB
         )
         return
-    context.user_data.clear()
+    reset_flow_keep_phone(context)
     context.user_data["step"] = "dep_query"
 
     await update.effective_message.reply_text(
@@ -511,9 +536,9 @@ async def start_route(update, context):
 
 async def back_to_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    context.user_data.clear()
+    reset_flow_keep_phone(context)
 
-    if has_active_watch(context, chat_id):
+    if await has_active_watch_db(chat_id):
         await update.effective_message.reply_text("Menyu 👇", reply_markup=kb_watch_controls())
     else:
         await update.effective_message.reply_text("Menyu 👇", reply_markup=kb_route_only())
@@ -796,6 +821,26 @@ async def choose_date_to(update, context):
         f"Endi qidiruvni boshlaymiz (keyingi qadam)."
     )
 
+
+async def _safe_edit_text(query, text: str, reply_markup=None):
+    try:
+        await query.edit_message_text(text, reply_markup=reply_markup)
+    except BadRequest as e:
+        s = str(e)
+        if ("Message is not modified" in s) or ("Message to edit not found" in s):
+            return
+        raise
+
+async def _safe_edit_markup(query, reply_markup):
+    try:
+        await query.edit_message_reply_markup(reply_markup=reply_markup)
+    except BadRequest as e:
+        s = str(e)
+        if ("Message is not modified" in s) or ("Message to edit not found" in s):
+            return
+        raise
+
+
 async def calendar_handler(update, context):
     query = update.callback_query
     data = query.data or ""
@@ -819,7 +864,7 @@ async def calendar_handler(update, context):
 
     # NAV: oy almashtirish
     if action == "NAV":
-        await query.edit_message_reply_markup(reply_markup=build_calendar(y, m, mode))
+        await _safe_edit_markup(query, build_calendar(y, m, mode))
         return
 
     if action == "CANCEL":
@@ -827,7 +872,7 @@ async def calendar_handler(update, context):
         context.user_data.pop("date_to", None)
         context.user_data["step"] = None
 
-        await query.edit_message_text("❌ Bekor qilindi.")
+        await _safe_edit_text(query,"❌ Bekor qilindi.")
         # xohlasangiz asosiy menyu tugmalarini qaytarib qo'yamiz:
         reply_keyboard = [
             ["📍 Yo'nalishni kiritish"],
@@ -854,7 +899,7 @@ async def calendar_handler(update, context):
             if selected_date < today:
                 # eski kalendarni yopamiz
                 try:
-                    await query.edit_message_text("❌ Boshlanish sana bugundan oldin bo‘lishi mumkin emas.")
+                    await _safe_edit_text(query, "❌ Boshlanish sana bugundan oldin bo‘lishi mumkin emas.")
                 except Exception:
                     pass
 
@@ -865,16 +910,28 @@ async def calendar_handler(update, context):
                 )
                 return
 
-            # Agar to‘g‘ri bo‘lsa davom etamiz
+                        # Agar to‘g‘ri bo‘lsa davom etamiz
             selected = selected_date.isoformat()
             context.user_data["date_from"] = selected
             context.user_data["step"] = "choose_date_to"
 
-            # Bosilgan kalendarni yopamiz
-            await query.edit_message_text(f"✅ Boshlanish sana tanlandi: {fmt_date(selected)}")
+            # ✅ 1) Bosilgan "Boshlanish sanasini tanlang" kalendar xabarini butunlay o‘chirib yuboramiz
+            try:
+                await query.message.delete()
+            except BadRequest as e:
+                # callback kechiksa/oldin o'chib ketsa - jim o'tkazamiz
+                if "Message to delete not found" in str(e):
+                    pass
+                else:
+                    pass  # xohlasangiz print qilib log qiling
+            
+            # ✅ 2) TASDIQ XABARI (faqat shu qoladi)
+            await query.message.chat.send_message(
+                f"✅ Boshlanish sana tanlandi: {fmt_date(selected)}"
+            )
 
-            # Tugash kalendari chiqadi
-            await query.message.reply_text(
+            # ✅ 3) Tugash kalendarini chiqaramiz (1 marta)
+            await query.message.chat.send_message(
                 "🗓 Tugash sanasini tanlang:",
                 reply_markup=build_calendar(y, m, "to")
             )
@@ -882,10 +939,11 @@ async def calendar_handler(update, context):
 
 
 
+
         if mode == "to":
             from_text = context.user_data.get("date_from")
             if not from_text:
-                await query.edit_message_text("Avval boshlanish sanani tanlang.")
+                await _safe_edit_text(query,"Avval boshlanish sanani tanlang.")
                 return
 
             from_d = date.fromisoformat(from_text)
@@ -896,7 +954,7 @@ async def calendar_handler(update, context):
             if (to_d - from_d).days > (MAX_DAYS - 1):
                 # Eski tugash kalendar xabarini yopamiz (xato yozuvi bilan)
                 try:
-                    await query.edit_message_text("❌ Maksimal 3 kun tanlash mumkin.")
+                    await _safe_edit_text(query,"❌ Maksimal 3 kun tanlash mumkin.")
                 except Exception:
                     pass
 
@@ -909,10 +967,7 @@ async def calendar_handler(update, context):
 
             if to_d < from_d:
                 # 1) Bosilgan (eski) kalendar xabarini yopamiz
-                try:
-                    await query.edit_message_text("❌ Tugash sanasi boshlanish sanasidan oldin bo‘lmasin.\n")
-                except Exception:
-                    pass
+                await _safe_edit_text(query, "❌ Tugash sanasi boshlanish sanasidan oldin bo‘lmasin.")
 
                 # 2) Yangi xato xabari + tagidan yangi kalendar
                 await query.message.reply_text(
@@ -920,8 +975,6 @@ async def calendar_handler(update, context):
                     reply_markup=build_calendar(y, m, "to")
                 )
                 return
-
-
 
             context.user_data["date_to"] = selected
             context.user_data["step"] = "done_range"
@@ -931,69 +984,71 @@ async def calendar_handler(update, context):
             dep_code = context.user_data.get("dep_code")
             arv_code = context.user_data.get("arv_code")
 
-            # 1) BOSILGAN KALENDAR XABARINI YOPAMIZ (shu o'zi!)
-            await query.edit_message_text(f"🗓 Tugash sanasini tanlang:")
+             # ✅ 1) Bosilgan tugash kalendar xabarini ham o‘chirib yuboramiz
+            try:
+                await query.message.delete()
+            except BadRequest as e:
+                # callback kechiksa/oldin o'chib ketsa - jim o'tkazamiz
+                if "Message to delete not found" in str(e):
+                    pass
+                else:
+                    pass  # xohlasangiz print qilib log qiling
 
-            # 2) (ixtiyoriy) tugash sana alohida SMS kerak bo‘lsa — mana bu qolsin:
-            await query.message.reply_text(f"✅ Tugash sana tanlandi: {fmt_date(selected)}")
+            # ✅ 1.1) Tugash sana tanlandi xabari (SIZ XOHlagan)
+            await query.message.chat.send_message(
+                f"✅ Tugash sana tanlandi: {fmt_date(selected)}"
+            )
 
-            # route matni: avval nom, bo‘lmasa kod
-            route_text = ""
+            from_text = context.user_data.get("date_from")
+
+            # route matni
             if dep_name and arv_name:
                 route_text = f"📍 {dep_name} → {arv_name}\n"
             elif dep_code and arv_code:
                 route_text = f"📍 {dep_code} → {arv_code}\n"
+            else:
+                route_text = ""
 
-            await query.message.reply_text(
-                "✅ Sana oralig‘i tanlandi !\n"
+            # ✅ 2) Faqat bitta yakuniy xabar (oraliq “✅ Sana oralig‘i tanlandi.” yo‘q!)
+            await query.message.chat.send_message(
+                "✅ Sana oralig‘i tanlandi!\n"
                 f"{route_text}"
                 f"🗓 {fmt_date(from_text)} ⟷ {fmt_date(selected)}\n\n"
                 "Shu oraliqda qidiruv natijalarini chiqaramiz."
             )
+
             await search_in_range_and_show(update, context)
             return
 
+        
+
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # if _need_phone(context):
-    #     await update.effective_message.reply_text(
-    #         "📱 Avval telefon raqamingizni yuboring.",
-    #         reply_markup=PHONE_KB
-    #     )
-    #     return
+
     chat_id = update.effective_chat.id
 
-    watch_chats = context.application.bot_data.get("watch_chats", {})
-    if isinstance(watch_chats, dict):
-        watch_chats.pop(chat_id, None)
-        context.application.bot_data["watch_chats"] = watch_chats
-
-    # istasangiz user_data ham tozalanadi:
-    context.user_data.clear()
-
+    await set_watch_enabled(DB_PATH, chat_id, False)
     await update.effective_message.reply_text(
-        "⛔ Kuzatish to‘xtatildi.\n"
-        "Yangi yo‘nalish kiritish uchun pastdagi tugmani bosing 👇",
-        reply_markup=MAIN_KB
+        "⏹ Kuzatish o‘chirildi.",
+        reply_markup=kb_route_only()
     )
+
 
 async def now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    watch_chats = context.application.bot_data.get("watch_chats", {})
-    cfg = watch_chats.get(chat_id)
+    w = await get_watch(DB_PATH, chat_id)
 
-    if not cfg or not cfg.get("enabled"):
+    if not w or not w.get("dep_code") or not w.get("arv_code") or not w.get("date_from") or not w.get("date_to"):
         await update.effective_message.reply_text(
-            "❌ Kuzatuv ma’lumoti to‘liq emas. Qaytadan yo‘nalish kiriting.",
-            reply_markup=MAIN_KB
+            "Hali yo‘nalish/sana tanlanmagan.\n📍 Avval: \"📍 Yo'nalishni kiritish\" qiling."
         )
         return
 
-    dep_code = cfg["dep"]
-    arv_code = cfg["arv"]
-    d_from = cfg["from"]
-    d_to = cfg["to"]
-    dep_name = cfg.get("dep_name") or str(dep_code)
-    arv_name = cfg.get("arv_name") or str(arv_code)
+    dep_code = w["dep_code"]
+    arv_code = w["arv_code"]
+    d_from = w["date_from"]
+    d_to = w["date_to"]
+    dep_name = w.get("dep_name") or str(dep_code)
+    arv_name = w.get("arv_name") or str(arv_code)
 
     await update.effective_message.reply_text("🔎 Tekshiryapman...")
 
@@ -1006,12 +1061,21 @@ async def now(update: Update, context: ContextTypes.DEFAULT_TYPE):
         full_text += format_trains(d, api, dep_name, arv_name)
         snapshot[d] = api
 
-    await update.effective_message.reply_text(full_text, reply_markup=WATCH_KB)
+    await update.effective_message.reply_text(full_text[:3900], reply_markup=WATCH_KB)
+    await update.effective_message.reply_text("🔄 Kuzatishda davom etaman.")
 
-    # snapshot yangilanib qolsin (keyingi kuzatuv uchun)
-    cfg["snapshot"] = snapshot
-    watch_chats[chat_id] = cfg
-    context.application.bot_data["watch_chats"] = watch_chats
+    # snapshot yangilab qo'yamiz (keyingi kuzatuv uchun)
+    await save_watch(DB_PATH, chat_id, {
+        "enabled": bool(w.get("enabled")),
+        "dep_code": dep_code,
+        "arv_code": arv_code,
+        "dep_name": dep_name,
+        "arv_name": arv_name,
+        "date_from": d_from,
+        "date_to": d_to,
+        "snapshot_json": json.dumps(snapshot, ensure_ascii=False, default=str),
+        "snapshot_hash": _safe_hash(snapshot),
+    })
 
 
 async def scheduled_job(context: ContextTypes.DEFAULT_TYPE):
@@ -1033,44 +1097,69 @@ async def route_button_router(update, context):
 
     # agar hozircha boshqa matn bo'lsa, e'tibor bermaymiz
 
+async def activity_middleware(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_chat:
+        return
+
+    chat_id = update.effective_chat.id
+    u = update.effective_user
+    await upsert_user(
+        DB_PATH,
+        chat_id=chat_id,
+        user_id=(u.id if u else None),
+        username=(u.username if u else None),
+        first_name=(u.first_name if u else None),
+        last_name=(u.last_name if u else None),
+    )
+
 
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN .env ichida yo'q yoki bo'sh")
     
-    base_dir = Path(__file__).resolve().parent
-    pkl_path = base_dir / "bot_data.pkl"
-    
-    persistence = PicklePersistence(filepath="bot_data.pkl")  # ✅ shu faylga saqlanadi
+    # DB init
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(init_db(DB_PATH))
 
     app = (
         Application.builder()
         .token(BOT_TOKEN)
-        .persistence(persistence)   # ✅ MUHIM
         .build()
     )
 
     async def error_handler(update, context):
-        print("❌ ERROR:", context.error)
+        try:
+            print(f"[ERROR] {type(context.error).__name__}: {context.error}")
+        except Exception:
+            pass
 
-    app.add_error_handler(error_handler)
+    # 0-group: middleware (hamma update)
+    app.add_handler(MessageHandler(filters.ALL, activity_middleware), group=0)
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.CONTACT, phone_contact_handler))
-    app.add_handler(MessageHandler(filters.Regex(r"^📍 Yo'nalishni kiritish$"), start_route))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, flow_handler))
-    app.add_handler(MessageHandler(filters.Regex(r"^🔙 Orqaga$"), back_to_main))
-    app.add_handler(CommandHandler("watch", watch))
-    app.add_handler(CommandHandler("stop", stop))
-    app.add_handler(CommandHandler("now", now))
-    app.add_handler(CallbackQueryHandler(inline_button_handler, pattern=r"^empty$"))
+    # 1-group: asosiy handlerlar (start ishlashi uchun)
+    app.add_handler(CommandHandler("start", start), group=1)
+    app.add_handler(MessageHandler(filters.CONTACT, phone_contact_handler), group=1)
+    app.add_handler(MessageHandler(filters.Regex(r"^📍 Yo'nalishni kiritish$"), start_route), group=1)
+    app.add_handler(MessageHandler(filters.Regex(r"^🔙 Orqaga$"), back_to_main), group=1)
+
+    app.add_handler(CommandHandler("watch", watch), group=1)
+    app.add_handler(CommandHandler("stop", stop), group=1)
+    app.add_handler(CommandHandler("now", now), group=1)
+
+    app.add_handler(CallbackQueryHandler(inline_button_handler, pattern=r"^empty$"), group=1)
+    app.add_handler(CallbackQueryHandler(calendar_handler, pattern=r"^CAL\|"), group=1)
+
+    # ⚠️ TEXT handlerlar bir-birini bosib ketmasin:
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, flow_handler), group=2)
+    # agar route_button_router kerak bo'lsa, uni ham group=2 qilib flow_handler bilan moslab qo'yish kerak
+    # app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, route_button_router), group=2)
+
+
 
     # JobQueue PTB ichida ishlaydi (event loop muammosiz)
     app.job_queue.run_repeating(watcher_job, interval=POLL_SECONDS, first=10)
-
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, route_button_router))
-    app.add_handler(CallbackQueryHandler(calendar_handler, pattern=r"^CAL\|"))
-
+    
     print("Bot ishga tushdi...")
     app.run_polling()
 
@@ -1097,6 +1186,10 @@ async def flow_handler(update, context):
         )
         return
     text = (update.message.text or "").strip()
+
+    # ✅ "📍 Yo'nalishni kiritish" tugmasini flow_handler bekat deb o‘qimasin
+    if text == "📍 Yo'nalishni kiritish":
+        return
 
     # Orqaga
     if text == "🔙 Orqaga":
@@ -1126,7 +1219,23 @@ async def flow_handler(update, context):
             await update.effective_message.reply_text("❗ Kamida 3 ta harf yozing. Masalan: Toshkent")
             return
         await update.effective_message.reply_text("🔎 Qidiryapman...")
-        items = await search_stations(q)
+        try:
+            items = await search_stations(q)
+        except RuntimeError as e:
+            msg = str(e)
+            # 424 texnik tanaffus bo'lsa userga tushunarli yozamiz
+            if "API status=424" in msg or "stations API status=424" in msg:
+                await update.effective_message.reply_text(
+                    "🛠 Hozir tizimda texnik tanaffus bor.\n"
+                    "Birozdan keyin qayta urinib ko‘ring (odatda 20-30 daqiqa).\n"
+                    "Agar xohlasangiz, boshqa bekat nomi bilan ham urinib ko‘ring."
+                )
+                return
+            await update.effective_message.reply_text("❌ Bekat qidirishda xatolik. Birozdan keyin qayta urinib ko‘ring.")
+            return
+        except Exception:
+            await update.effective_message.reply_text("❌ Bekat qidirishda xatolik. Birozdan keyin qayta urinib ko‘ring.")
+            return
 
         if not items:
             await update.effective_message.reply_text("❌ Bekat topilmadi. Yana yozib ko‘ring.")
@@ -1171,7 +1280,23 @@ async def flow_handler(update, context):
             await update.effective_message.reply_text("❗ Kamida 3 ta harf yozing. Masalan: Toshkent")
             return
         await update.effective_message.reply_text("🔎 Qidiryapman...")
-        items = await search_stations(q)
+        try:
+            items = await search_stations(q)
+        except RuntimeError as e:
+            msg = str(e)
+            # 424 texnik tanaffus bo'lsa userga tushunarli yozamiz
+            if "API status=424" in msg or "stations API status=424" in msg:
+                await update.effective_message.reply_text(
+                    "🛠 Hozir tizimda texnik tanaffus bor.\n"
+                    "Birozdan keyin qayta urinib ko‘ring (odatda 20-30 daqiqa).\n"
+                    "Agar xohlasangiz, boshqa bekat nomi bilan ham urinib ko‘ring."
+                )
+                return
+            await update.effective_message.reply_text("❌ Bekat qidirishda xatolik. Birozdan keyin qayta urinib ko‘ring.")
+            return
+        except Exception:
+            await update.effective_message.reply_text("❌ Bekat qidirishda xatolik. Birozdan keyin qayta urinib ko‘ring.")
+            return
 
         if not items:
             await update.effective_message.reply_text("❌ Bekat topilmadi. Yana yozib ko‘ring.")
@@ -1381,32 +1506,22 @@ async def search_in_range_and_show(update, context):
     # ✅ faqat 1 marta yuboramiz
     await update.effective_message.reply_text(full_text)
 
-    # ✅ kuzatishni yoqamiz va hamma kerakli narsani saqlaymiz
-    context.user_data["watch_enabled"] = True
-    context.user_data["snapshot"] = snapshot
-    context.user_data["watch_dep"] = dep_code
-    context.user_data["watch_arv"] = arv_code
-    context.user_data["watch_from"] = d_from
-    context.user_data["watch_to"] = d_to
-    context.user_data["watch_chat_id"] = msg.chat_id
-
+    # ✅ DB'ga watch konfiguratsiya + snapshot saqlaymiz
     chat_id = update.effective_chat.id
 
-    watch_chats = context.application.bot_data.get("watch_chats", {})
-    if not isinstance(watch_chats, dict):
-        watch_chats = {}
+    snapshot_hash = _safe_hash(snapshot)
 
-    watch_chats[chat_id] = {
+    await save_watch(DB_PATH, chat_id, {
         "enabled": True,
-        "dep_code": dep_code,
-        "arv_code": arv_code,
+        "dep_code": str(dep_code),
+        "arv_code": str(arv_code),
         "dep_name": context.user_data.get("dep_name"),
         "arv_name": context.user_data.get("arv_name"),
-        "date_from": d_from,
-        "date_to": d_to,
-        "snapshot": snapshot,
-    }
-    context.application.bot_data["watch_chats"] = watch_chats
+        "date_from": str(d_from),
+        "date_to": str(d_to),
+        "snapshot_json": json.dumps(snapshot, ensure_ascii=False, default=str),
+        "snapshot_hash": snapshot_hash,
+    })
 
     await update.effective_message.reply_text(
         "🔔 Kuzatish boshlandi.\n"
@@ -1414,25 +1529,6 @@ async def search_in_range_and_show(update, context):
         "yoki yangi vagon chiqsa — darhol habar beraman.",
         reply_markup=WATCH_KB
     )
-
-
-
-    # ✅ JobQueue ko‘ra olishi uchun application.chat_data ga ham yozamiz
-    watch_chats = context.application.bot_data.get("watch_chats", {})
-
-    watch_chats[msg.chat_id] = {
-        "enabled": True,
-        "dep": dep_code,
-        "arv": arv_code,
-        "from": d_from,
-        "to": d_to,
-        "snapshot": snapshot,
-        "dep_name": context.user_data.get("dep_name"),
-        "arv_name": context.user_data.get("arv_name"),
-    }
-
-    context.application.bot_data["watch_chats"] = watch_chats
-
 
 
 def _safe_hash(obj) -> str:
@@ -1452,70 +1548,81 @@ def diff_snapshot(old_api: dict, new_api: dict) -> bool:
     """
     return _safe_hash(old_api) != _safe_hash(new_api)
 
-async def watcher_job(context):
-    """
-    Har POLL_SECONDS da tekshiradi.
-    O'zgarish bo'lsa chatga yuboradi va snapshotni yangilaydi.
-    """
-    # user_data yo'q: JobQueue faqat application context beradi,
-    # shuning uchun biz chat_id larni application.chat_data da yuritamiz.
-    # Lekin siz bitta user bilan ishlayapsiz — shuning uchun sodda yo'l:
-    chats = context.application.bot_data.get("watch_chats", {})
 
-    if not chats:
+
+async def watcher_job(context: ContextTypes.DEFAULT_TYPE):
+    watches = await list_enabled_watches(DB_PATH)
+    if not watches:
         return
 
-    for chat_id, w in list(chats.items()):
-        if not w.get("enabled"):
-            continue
+    for w in watches:
+        chat_id = int(w["chat_id"])
 
-        dep = w["dep"]
-        arv = w["arv"]
-        d_from = w["from"]
-        d_to = w["to"]
-        old_snapshot = w.get("snapshot", {})
+        dep_code = w.get("dep_code")
+        arv_code = w.get("arv_code")
+        d_from = w.get("date_from")
+        d_to = w.get("date_to")
+
+        if not dep_code or not arv_code or not d_from or not d_to:
+            continue  # hali user qidiruv qilmagan
+
+        dep_name = w.get("dep_name") or str(dep_code)
+        arv_name = w.get("arv_name") or str(arv_code)
+
+        old_hash = w.get("snapshot_hash") or ""
+        old_snapshot = {}
+        if w.get("snapshot_json"):
+            try:
+                old_snapshot = json.loads(w["snapshot_json"])
+            except Exception:
+                old_snapshot = {}
 
         new_snapshot = {}
         changed_days = []
 
         for d in iter_dates(d_from, d_to):
             try:
-                api = await fetch_trains(dep, arv, d)
+                async with WATCH_SEM:
+                    api = await fetch_trains(dep_code, arv_code, d)
             except Exception as e:
-                # JobQueue yiqilib ketmasin — keyingi siklda yana urinadi
-                print(f"[watcher_job] fetch_trains error: {e}")
+                print(f"[watcher_job] fetch_trains error chat_id={chat_id}: {e}")
                 continue
+
             new_snapshot[d] = api
 
             old_api = old_snapshot.get(d)
             if old_api is not None and diff_snapshot(old_api, api):
                 changed_days.append(d)
 
+        new_hash = _safe_hash(new_snapshot)
+        if old_hash and new_hash == old_hash:
+            continue  # umuman o'zgarish yo'q
+
         if changed_days:
-            dep_name = w.get("dep_name") or dep
-            arv_name = w.get("arv_name") or arv
+            text = "🚨 O‘zgarish aniqlandi!\n"
+            text += f"📍 {dep_name} → {arv_name}\n"
 
-            text = (
-                "🚨 O‘zgarish aniqlandi!\n"
-                f"📍 {dep_name} → {arv_name}\n"
-            )
-
-            for d in changed_days:
+            for d in changed_days[:3]:  # spam bo'lmasin (xohlasang olib tashlaymiz)
                 text += f"\n\n📅 {fmt_date(d)}\n"
                 old_api = old_snapshot.get(d, {})
                 new_api = new_snapshot.get(d, {})
                 text += _watch_day_report(old_api, new_api)
 
             text += "\n\n🔄 Kuzatishda davom etaman."
+            await context.application.bot.send_message(chat_id=chat_id, text=text[:3900])
 
-            await context.bot.send_message(chat_id=chat_id, text=text)
-
-            # yangisini saqlab qo'yamiz
-            w["snapshot"] = new_snapshot
-            chats[chat_id] = w
-
-
-    context.application.bot_data["watch_chats"] = chats
+        # snapshotni DBga yangilab qo'yamiz
+        await save_watch(DB_PATH, chat_id, {
+            "enabled": True,
+            "dep_code": dep_code,
+            "arv_code": arv_code,
+            "dep_name": dep_name,
+            "arv_name": arv_name,
+            "date_from": d_from,
+            "date_to": d_to,
+            "snapshot_json": json.dumps(new_snapshot, ensure_ascii=False, default=str),
+            "snapshot_hash": new_hash,
+        })
 
 
 if __name__ == "__main__":

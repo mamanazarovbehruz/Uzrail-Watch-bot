@@ -108,8 +108,18 @@ async def _fetch_trains_manual(depStationCode: str, arvStationCode: str, date_is
     headers = _manual_headers()
     async with httpx.AsyncClient(headers=headers, timeout=30, follow_redirects=True) as client:
         r = await client.post(ENDPOINT, json=payload)
-        r.raise_for_status()
+        text = (r.text or "")[:300]
+
+        # ✅ 400/401/403/419 bo'lsa RuntimeError formatida qaytaramiz
+        # (fetch_trains() ichidagi refresh/retry shuni taniydi)
+        if r.status_code in (400, 401, 403, 419):
+            raise RuntimeError(f"API status={r.status_code}. Body: {text}")
+
+        if r.status_code != 200:
+            raise RuntimeError(f"API status={r.status_code}. Body: {text}")
+
         return r.json()
+
 
 async def _fetch_trains_auto(depStationCode: str, arvStationCode: str, date_iso: str) -> dict:
     payload = {
