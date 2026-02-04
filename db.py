@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS users (
   last_name    TEXT,
   phone        TEXT,
   registered   INTEGER DEFAULT 0,
+  lang         TEXT DEFAULT 'uz',
   first_seen   TEXT,
   last_seen    TEXT,
   plan         TEXT DEFAULT 'free',
@@ -40,12 +41,59 @@ CREATE TABLE IF NOT EXISTS watches (
   updated_at TEXT,
   FOREIGN KEY(chat_id) REFERENCES users(chat_id)
 );
+
+CREATE TABLE IF NOT EXISTS feedbacks (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  chat_id    INTEGER NOT NULL,
+  text       TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(chat_id) REFERENCES users(chat_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_feedbacks_chat_id ON feedbacks(chat_id);
 """
+
+async def _ensure_column(db, table: str, column: str, ddl: str):
+    cur = await db.execute(f"PRAGMA table_info({table})")
+    cols = [r[1] for r in await cur.fetchall()]
+    if column not in cols:
+        await db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
 async def init_db(db_path: str):
     async with aiosqlite.connect(db_path) as db:
         await db.executescript(CREATE_SQL)
+
+        # ✅ eski DB bo‘lsa ham yangi ustun qo‘shib oladi
+        await _ensure_column(db, "users", "lang", "TEXT DEFAULT 'uz'")
+
+        # ✅ feedbacks jadvali yo‘q bo‘lsa yaratib oladi
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS feedbacks (
+              id         INTEGER PRIMARY KEY AUTOINCREMENT,
+              chat_id    INTEGER NOT NULL,
+              text       TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              FOREIGN KEY(chat_id) REFERENCES users(chat_id)
+            )
+            """
+        )
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_feedbacks_chat_id ON feedbacks(chat_id)")
         await db.commit()
+
+async def set_lang(db_path: str, chat_id: int, lang: str):
+    lang = (lang or "uz").lower()
+    if lang not in ("uz", "ru", "en"):
+        lang = "uz"
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute("UPDATE users SET lang=?, last_seen=? WHERE chat_id=?", (lang, now_utc_iso(), chat_id))
+        await db.commit()
+
+async def get_lang(db_path: str, chat_id: int) -> str | None:
+    async with aiosqlite.connect(db_path) as db:
+        cur = await db.execute("SELECT lang FROM users WHERE chat_id=?", (chat_id,))
+        row = await cur.fetchone()
+        return row[0] if row and row[0] else None
 
 async def upsert_user(db_path: str, chat_id: int, user_id: int | None, username: str | None,
                       first_name: str | None, last_name: str | None):
@@ -187,3 +235,45 @@ async def list_enabled_watches(db_path: str) -> list[dict]:
                 "snapshot_hash": r[9],
             })
         return out
+
+# =========================
+# LANG + FEEDBACK FUNCTIONS
+# =========================
+
+async def get_user_lang(db_path: str, chat_id: int) -> str:
+    async with aiosqlite.connect(db_path) as db:
+        cur = await db.execute(
+            "SELECT lang FROM users WHERE chat_id=?",
+            (chat_id,)
+        )
+        row = await cur.fetchone()
+        lang = (row[0] if row and row[0] else "uz").lower()
+        return lang if lang in ("uz", "ru", "en") else "uz"
+
+async def set_user_lang(db_path: str, chat_id: int, lang: str):
+    lang = (lang or "uz").lower()
+    if lang not in ("uz", "ru", "en"):
+        lang = "uz"
+
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            "UPDATE users SET lang=?, last_seen=? WHERE chat_id=?",
+            (lang, now_utc_iso(), chat_id)
+        )
+        await db.commit()
+
+async def add_feedback(db_path: str, chat_id: int, text: str):
+    text = (text or "").strip()
+    if not text:
+        return
+
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            "INSERT INTO feedbacks(chat_id, text, created_at) VALUES(?,?,?)",
+            (chat_id, text, now_utc_iso()),
+        )
+        await db.execute(
+            "UPDATE users SET last_seen=? WHERE chat_id=?",
+            (now_utc_iso(), chat_id),
+        )
+        await db.commit()

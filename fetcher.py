@@ -12,6 +12,7 @@ BASE = "https://eticket.railway.uz"
 ENDPOINT = f"{BASE}/api/v3/handbook/trains/list"
 CSRF_URL = f"{BASE}/api/v1/csrf-token"
 
+_cookie_lang = None
 _csrf_token = None
 _csrf_cookies = None
 _csrf_lock = asyncio.Lock()
@@ -79,14 +80,17 @@ def make_summary(api_json: dict) -> dict:
 
     return out
 
+def _manual_headers(lang: str = "uz") -> dict:
+    lang = (lang or "uz").lower()
+    if lang not in ("uz", "ru", "en"):
+        lang = "uz"
 
-def _manual_headers() -> dict:
     return {
         "Accept": "application/json",
-        "Accept-Language": "uz",
+        "Accept-Language": lang,
         "Content-Type": "application/json",
         "Origin": BASE,
-        "Referer": f"{BASE}/uz/home",
+        "Referer": f"{BASE}/{lang}/home",
         "User-Agent": "Mozilla/5.0",
         "X-XSRF-TOKEN": XSRF,
         "device-type": "BROWSER",
@@ -94,7 +98,8 @@ def _manual_headers() -> dict:
     }
 
 
-async def _fetch_trains_manual(depStationCode: str, arvStationCode: str, date_iso: str) -> dict:
+
+async def _fetch_trains_manual(depStationCode, arvStationCode, date_iso, lang: str = "uz"):
     payload = {
         "directions": {
             "forward": {
@@ -105,7 +110,7 @@ async def _fetch_trains_manual(depStationCode: str, arvStationCode: str, date_is
         }
     }
 
-    headers = _manual_headers()
+    headers = _manual_headers(lang)
     async with httpx.AsyncClient(headers=headers, timeout=30, follow_redirects=True) as client:
         r = await client.post(ENDPOINT, json=payload)
         text = (r.text or "")[:300]
@@ -121,7 +126,7 @@ async def _fetch_trains_manual(depStationCode: str, arvStationCode: str, date_is
         return r.json()
 
 
-async def _fetch_trains_auto(depStationCode: str, arvStationCode: str, date_iso: str) -> dict:
+async def _fetch_trains_auto(depStationCode, arvStationCode, date_iso, lang: str = "en"):
     payload = {
         "directions": {
             "forward": {
@@ -142,9 +147,9 @@ async def _fetch_trains_auto(depStationCode: str, arvStationCode: str, date_iso:
         context = await browser.new_context(
             extra_http_headers={
                 "Accept": "application/json, text/plain, */*",
-                "Accept-Language": "en-US,en;q=0.9,ru;q=0.8,uz;q=0.7",
+                "Accept-Language": lang,
                 "Origin": BASE,
-                "Referer": f"{BASE}/en/home",
+                "Referer": f"{BASE}/{lang}/home",
                 "device-type": "web",
                 "User-Agent": (
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -181,10 +186,10 @@ async def _fetch_trains_auto(depStationCode: str, arvStationCode: str, date_iso:
 
             headers = {
                 "Accept": "application/json, text/plain, */*",
-                "Accept-Language": "en-US,en;q=0.9,ru;q=0.8,uz;q=0.7",
+                "Accept-Language": lang,
                 "Content-Type": "application/json",
                 "Origin": BASE,
-                "Referer": f"{BASE}/en/home",
+                "Referer": f"{BASE}/{lang}/home",
                 "device-type": "web",
                 "User-Agent": (
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -215,22 +220,34 @@ async def _fetch_trains_auto(depStationCode: str, arvStationCode: str, date_iso:
         await browser.close()
         raise RuntimeError(f"API failed after {max_tries} retries. Last body: {last_text}")
 
-async def fetch_trains(depStationCode, arvStationCode, date_iso):
+async def fetch_trains(depStationCode, arvStationCode, date_iso, lang: str = "uz"):
+    global _cookie_lang
+    lang = (lang or "uz").lower()
+    if lang not in ("uz", "ru", "en"):
+        lang = "uz"
+
+    # ✅ til o'zgargan bo'lsa cookie ham shu tilga mos yangilanadi
+    if _cookie_lang != lang:
+        new_cookie, new_xsrf = await refresh_cookie_via_playwright(lang=lang, max_tries=3)
+        os.environ["COOKIE"] = new_cookie
+        os.environ["XSRF_TOKEN"] = new_xsrf
+        _cookie_lang = lang
+        
     # 1) avval MANUAL urinamiz (eng stabil)
     try:
-        return await _fetch_trains_manual(depStationCode, arvStationCode, date_iso)
+        return await _fetch_trains_manual(depStationCode, arvStationCode, date_iso, lang)
     except RuntimeError as e:
         msg = str(e)
         # 400/401/403/419 bo'lsa cookie eskirgan bo'lishi mumkin
         if any(x in msg for x in ["API status=400", "API status=401", "API status=403", "API status=419"]):
             # 2) cookie yangilab, yana bir marta urinib ko'ramiz
-            new_cookie, new_xsrf = await refresh_cookie_via_playwright(max_tries=3)
+            new_cookie, new_xsrf = await refresh_cookie_via_playwright(lang=lang, max_tries=3)
 
             # global/env o'rniga runtime-da ishlatamiz:
             os.environ["COOKIE"] = new_cookie
             os.environ["XSRF_TOKEN"] = new_xsrf
 
-            return await _fetch_trains_manual(depStationCode, arvStationCode, date_iso)
+            return await _fetch_trains_manual(depStationCode, arvStationCode, date_iso, lang)
 
         raise
 
@@ -291,7 +308,7 @@ async def _fetch_json_auto(url: str, method: str = "GET", payload: dict | None =
 
 STATIONS_ENDPOINT = f"{BASE}/api/v1/handbook/stations/list"
 
-async def search_stations(name: str) -> list[dict]:
+async def search_stations(name: str, lang: str = "uz") -> list[dict]:
     """
     eticket.railway.uz dan bekatlarni qidiradi.
     return: [{"code":"2900000","name":"TASHKENT"}, ...]
@@ -300,9 +317,8 @@ async def search_stations(name: str) -> list[dict]:
     if not name:
         return []
 
-    headers = _manual_headers().copy()
-    # v1 endpoint uchun referer/en ishlatamiz
-    headers["Referer"] = f"{BASE}/en/home"
+    headers = _manual_headers(lang).copy()
+    headers["Referer"] = f"{BASE}/{lang}/home"
     headers["Origin"] = BASE
 
     payload = {"name": name.lower()}
@@ -330,20 +346,25 @@ async def search_stations(name: str) -> list[dict]:
         return out
 
 
-async def refresh_cookie_via_playwright(max_tries: int = 3) -> tuple[str, str]:
+async def refresh_cookie_via_playwright(lang: str = "en", max_tries: int = 3) -> tuple[str, str]:
     """
     returns: (COOKIE_HEADER, XSRF_TOKEN)
     """
+    lang = (lang or "en").lower()
+    if lang not in ("uz", "ru", "en"):
+        lang = "en"
+
     last_err = None
     for attempt in range(1, max_tries + 1):
         try:
             async with async_playwright() as p:
                 browser = await p.chromium.launch(headless=True)
-                context = await browser.new_context()
+                context = await browser.new_context(
+                    extra_http_headers={"Accept-Language": lang}
+                )
                 page = await context.new_page()
 
-                await page.goto(f"{BASE}/en/home", wait_until="domcontentloaded")
-                # timeout ni oshiramiz
+                await page.goto(f"{BASE}/{lang}/home", wait_until="domcontentloaded")
                 await context.request.get(CSRF_URL, timeout=45000)
 
                 cookies = await context.cookies()

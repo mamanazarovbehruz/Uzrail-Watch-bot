@@ -1,13 +1,22 @@
 import os
 import json
+import re
 from dotenv import load_dotenv
 import calendar
 from datetime import date, timedelta,datetime
 from fetcher import fetch_trains, make_summary, search_stations
-from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton
+from telegram import (
+    Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton
+)
 from pathlib import Path
 from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters
-from db import init_db, upsert_user, touch_last_seen, set_phone, get_phone, save_watch, get_watch, set_watch_enabled, list_all_users, list_enabled_watches
+from db import (
+    init_db, upsert_user, touch_last_seen,
+    set_phone, get_phone,
+    save_watch, get_watch, set_watch_enabled,
+    list_all_users, list_enabled_watches,
+    get_user_lang, set_user_lang, add_feedback
+)
 import asyncio
 from telegram.error import BadRequest
 
@@ -20,6 +29,7 @@ WATCH_CHAT_ID = os.getenv("WATCH_CHAT_ID", "").strip()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 DB_PATH = os.getenv("DB_PATH", "bot.db").strip()
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "120"))
+MAX_TG = 3900  # 4096 dan biroz past (xavfsiz)
 
 # Hozircha bitta yo'nalish/sana (keyin /add bilan ko'paytiramiz)
 DEP = "2900000"
@@ -30,37 +40,494 @@ STATE_FILE = f"state_{DEP}_{ARV}_{DATE}.json"
 
 STATIONS = ["Toshkent", "Samarqand", "Buxoro", "Andijon", "Termiz", "Qo‘qon"]
 
-PHONE_KB = ReplyKeyboardMarkup(
-    [[KeyboardButton("📱 Telefon raqamni yuborish", request_contact=True)]],
-    resize_keyboard=True,
-    one_time_keyboard=True,
-)
 
-MAIN_KB = ReplyKeyboardMarkup(
-    [["📍 Yo'nalishni kiritish"]],
-    resize_keyboard=True
-)
+async def send_long_text(update, text: str, *, chunk_size: int = MAX_TG, reply_markup=None):
+    text = text or ""
+    msg = update.effective_message
 
-WATCH_KB = ReplyKeyboardMarkup(
-    [
-        ["/now — hozir tekshirish"],
-        ["/stop — kuzatishni o‘chirish"],
-    ],
-    resize_keyboard=True
-)
+    if not text.strip():
+        await msg.reply_text("❌ No results.")
+        return
+
+    parts = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
+
+    for idx, part in enumerate(parts):
+        # ✅ keyboard faqat 1-xabarga (tagiga) qo'yiladi
+        if idx == 0:
+            await msg.reply_text(part, reply_markup=reply_markup)
+        else:
+            await msg.reply_text(part)
+
+def buy_ticket_kb(lang: str):
+    lang = (lang or "uz").lower()
+    if lang not in ("uz", "ru", "en"):
+        lang = "uz"
+
+    # ✅ ilova bo'lsa app-link orqali ilovaga o'tishi mumkin, bo'lmasa web ochiladi
+    url = f"https://eticket.railway.uz/{lang}/home"
+
+    label = {
+        "uz": "🎫 Bilet sotib olish",
+        "ru": "🎫 Купить билет",
+        "en": "🎫 Buy ticket",
+    }.get(lang, "🎫 Buy ticket")
+
+    return InlineKeyboardMarkup([[InlineKeyboardButton(label, url=url)]])
 
 
-def kb_route_only():
+
+def t(lang: str, key: str, **kwargs) -> str:
+    lang = (lang or "uz").lower()
+    if lang not in ("uz", "ru", "en"):
+        lang = "uz"
+    s = TEXT.get(key, {}).get(lang) or TEXT.get(key, {}).get("uz") or key
+    try:
+        return s.format(**kwargs)
+    except Exception:
+        return s
+
+
+LANG_PREFIX = "LANG"  # callback: LANG|uz / LANG|ru / LANG|en
+
+LANG_KB = InlineKeyboardMarkup([
+    [InlineKeyboardButton("🇺🇿 O'zbekcha", callback_data=f"{LANG_PREFIX}|uz")],
+    [InlineKeyboardButton("🇷🇺 Русский", callback_data=f"{LANG_PREFIX}|ru")],
+    [InlineKeyboardButton("🇺🇸 English", callback_data=f"{LANG_PREFIX}|en")],
+])
+
+# =========================
+# i18n (UZ/RU/EN)
+# =========================
+
+BTN = {
+    "route": {"uz": "📍 Yo'nalishni kiritish", "ru": "📍 Ввести маршрут", "en": "📍 Enter route"},
+    "contact": {"uz": "📞 Aloqa", "ru": "📞 Контакты", "en": "📞 Contact"},
+    "lang": {"uz": "🌐 Tilni tanlash", "ru": "🌐 Выбор языка", "en": "🌐 Language"},
+    "feedback": {"uz": "⭐️ Fikr qoldirish", "ru": "⭐️ Оставить отзыв", "en": "⭐️ Leave feedback"},
+    "back": {"uz": "🔙 Orqaga", "ru": "🔙 Назад", "en": "🔙 Back"},
+    "check_now": {"uz": "/now — hozir tekshirish", "ru": "/now - сейчас проверить", "en": "/now - check now"},
+    "stop_track": {"uz": "/stop — kuzatishni o‘chirish", "ru": "/stop - отключить наблюдение", "en": "/stop - turn off tracking"},
+    "send_phone": {"uz": "📱 Telefon raqamni yuborish", "ru": "📱 Отправить номер", "en": "📱 Send phone"},
+}
+
+TEXT = {
+    "start_hi": {
+        "uz": "Salom, {first}!\nMen O‘zbekiston temir yo‘l poyezd chiptalaridagi o‘zgarishlarni kuzataman va sizga habar beraman.\n\nYo‘nalishni tanlang 👇",
+        "ru": "Здравствуйте, {first}!\nЯ отслеживаю изменения билетов на поезда Узбекистон темир йуллари и уведомляю вас.\n\nВыберите действие 👇",
+        "en": "Hi, {first}!\nI track changes in Uzbekistan Railways tickets and notify you.\n\nChoose an option 👇",
+    },
+    "welcome": {
+        "uz": "Poyezd Chiptalari Kuzatuvchi botiga xush kelibsiz!",
+        "ru": "Добро пожаловать в бот мониторинга билетов!",
+        "en": "Welcome to the ticket monitoring bot!",
+    },
+    "ask_phone": {
+        "uz": "📱 Iltimos, pastdagi tugma orqali telefon raqamingizni yuboring.",
+        "ru": "📱 Пожалуйста, отправьте свой номер телефона по кнопке ниже.",
+        "en": "📱 Please, send your phone number using the button below.",
+    },
+    "phone_ok": {"uz": "Telefon raqamingiz qabul qilindi ✅", "ru": "Номер принят ✅", "en": "Phone received ✅"},
+    "main_home": {"uz": "Bosh sahifa 👇", "ru": "Главное меню 👇", "en": "Home 👇"},
+    "feedback_ask": {
+        "uz": "⭐️ Fikr qoldiring:\nTaklifingizni bitta xabar qilib yozing.",
+        "ru": "⭐️ Оставьте отзыв:\nНапишите предложение одним сообщением.",
+        "en": "⭐️ Leave feedback:\nWrite it in one message.",
+    },
+    "feedback_ok": {"uz": "✅ Rahmat! Fikringiz qabul qilindi.", "ru": "✅ Спасибо! Отзыв принят.", "en": "✅ Thanks! Feedback saved."},
+    "lang_choose": {"uz": "Iltimos, Tilni tanlang", "ru": "Пожалуйста, выберите язык", "en": "Please choose language"},
+    "lang_saved": {"uz": "✅ Til saqlandi.", "ru": "✅ Язык сохранён.", "en": "✅ Language saved."},
+    "searching": {"uz": "🔎 Qidiryapman...", "ru": "🔎 Ищу...", "en": "🔎 searching..."},
+    "search_start": {"uz": "🔍 Qidiruv boshlandi...", "ru": "🔎 Поиск начался...", "en": "🔎 Search started..."},
+    "tech_break": {
+        "uz": "⏳ Texnik tanaffus: {start}–{end}\nBirozdan keyin qayta urinib ko‘ring.",
+        "ru": "⏳ Технический перерыв: {start}–{end}\nПопробуйте позже.",
+        "en": "⏳ Technical break: {start}–{end}\nPlease try later.",
+    },
+    "leaving_from": {
+        "uz": "Qayerdan ketasiz?  (Bekatni yozing. Misol uchun: Toshkent)",
+        "ru": "Откуда вы едете?  (Напишите станцию отправления. Например: Ташкент)",
+        "en": "Where are you leaving from?  (Write the station. For example: Tashkent)",
+    },
+    "go_to": {
+        "uz": "Qayerga borasiz? (Bekatni yozing. Misol uchun: Termiz)",
+        "ru": "Куда вы идёте? (Напишите остановку. Например: Термез)",
+        "en": "Where are you going? (Write the destination. For example: Termez)",
+    },
+    "choose_station": {
+        "uz": "Topilgan bekatlardan birini tanlang:",
+        "ru": "Выберите одну из найденных остановок:",
+        "en": "Choose one of the available stations:",
+    },
+    "start_data": {
+        "uz": "✅ Boshlanish sana tanlandi:",
+        "ru": "✅ Выбрана дата начала:",
+        "en": "✅ Start date selected:",
+    },
+    "end_data": {
+        "uz": "✅ Tugash sana tanlandi:",
+        "ru": "✅ Выбрана дата окончания:",
+        "en": "✅ End date selected:",
+    },
+    "interval_data": {
+        "uz": "✅ Sana oralig‘i tanlandi!",
+        "ru": "✅ Выбран диапазон дат!",
+        "en": "✅ Date interval selected!",
+    },
+    "interval_result": {
+        "uz": "Shu oraliqda qidiruv natijalarini chiqaramiz.",
+        "ru": "Мы показываем результаты поиска в этом диапазоне.",
+        "en": "We'll show search results in this range.",
+    },
+    "available_tickets": {
+        "uz": "🎟 Mavjud chiptalar:",
+        "ru": "🎟 Доступные билеты:",
+        "en": "🎟 Available tickets:",
+    },
+    "no_available": {
+        "uz": "❌ Bu kunda bo‘sh joy topilmadi.",
+        "ru": "❌ В этот день нет свободных мест.",
+        "en": "❌ No availability on this day.",
+    },
+    "no_trains": {
+        "uz": "❌ Bu kunda poyezd topilmadi.",
+        "ru": "❌ На этот день поезда не обнаружено.",
+        "en": "❌ No trains on this day.",
+    },
+    "traver_duration": {
+        "uz": "⏱️ Yo‘l davomiyligi:",
+        "ru": "⏱️ Продолжительность пути:",
+        "en": "⏱️ Travel duration:",
+    },
+    "available_place": {
+        "uz": "📋 Bo‘sh o‘rinlar : ",
+        "ru": "📋 Пустые места:",
+        "en": "📋 Available places:",
+    },
+    "monitoring": {
+        "uz": "🔔 Kuzatish boshlandi.\n Agar joylar kamayib yoki ko‘payib ketsa, \n yoki yangi vagon chiqsa — darhol habar beraman.",
+        "ru": "🔔 Наблюдение началось.\n Если места уменьшаются или увеличиваются, \n или если появится новый вагон - сразу же сообщу.",
+        "en": "🔔 Monitoring has begun. \n If the number of seats decreases or increases, \n or if a new wagon becomes available - I'll inform you immediately.",
+    },
+    "choose_start_data": {
+        "uz": "🗓 Boshlanish sanasini tanlang:",
+        "ru": "🗓 Выберите дату начала:",
+        "en": "🗓 Choose the start date:",
+    },
+    "choose_end_data": {
+        "uz": "🗓 Tugash sanasini tanlang:",
+        "ru": "🗓 Выберите дату окончания:",
+        "en": "🗓 Select end date:",
+    },
+    "xato2": {
+        "uz": "❌ Boshlanish sana bugundan oldin bo‘lishi mumkin emas.",
+        "ru": "❌ Дата начала не может быть раньше сегодняшнего дня.",
+        "en": "❌ The start date cannot be earlier than today.",
+    },
+    "new_train": {
+        "uz": "🆕 Yangi poezd paydo bo‘ldi",
+        "ru": "🆕 Появился новый поезд",
+        "en": "🆕 A new train has appeared",
+    },
+    "delete_list": {
+        "uz": "🗑 Poezd ro‘yxatdan yo‘qoldi",
+        "ru": "🗑 Поезд исчез из списка",
+        "en": "🗑 Train disappeared from list",
+    },
+    "currency": {"uz": "so‘m", "ru": "сум", "en": "sum",},
+    "item": {"uz": "ta", "ru": " ", "en": " ",},
+    "new_type": {"uz": "yangi vagon turi", "ru": "новый тип вагона", "en": "new type of car",},
+    "type_lost": {
+        "uz": "vagon turi yo‘qoldi",
+        "ru": "тип вагона потерян",
+        "en": "the type of car is lost",
+    },
+    "belite_sold": {
+        "uz": "belit sotildi",
+        "ru": "белит продан",
+        "en": "belite sold",
+    },
+    "belite_add": {
+        "uz": "belit qo‘shildi",
+        "ru": "белит добавлен",
+        "en": "belit added",
+    },
+    "place": {"uz": "joy", "ru": "место", "en": "place",},
+    "high": {"uz": "Tepa", "ru": "Высокий", "en": "High",},
+    "lower": {"uz": "Pastki", "ru": "Нижний", "en": "Lower",},
+    "train_lost": {
+        "uz": "Poezd yo‘qoldi:",
+        "ru": "Поезд пропал:",
+        "en": "Train lost:",
+    },
+    "plase_change": {
+        "uz": "Joy o‘zgardi:",
+        "ru": "Место изменилось:",
+        "en": "Place changed:",
+    },
+    "cancel": {
+        "uz": "❌ Bekor qilish",
+        "ru": "❌ Отмена",
+        "en": "❌ Cancel",
+    },
+    "new_found": {
+        "uz": "🚆 Yangilik topildi!",
+        "ru": "🚆 Найдено новости!",
+        "en": "🚆 News found!",
+    },
+    "comrade": {
+        "uz": "Birodar",
+        "ru": "Братан",
+        "en": "Comrade",
+    },
+    "first_start": {
+        "uz": "✅ Birinchi ishga tushdi. Holat saqlandi, kuzatish boshlandi.",
+        "ru": "✅ Первый запущен. Сохранено состояние, начато наблюдение.",
+        "en": "✅ Launched first. Status saved, tracking started.",
+    },
+    "sent_phone_first": {
+        "uz": "📱 Avval telefon raqamingizni yuboring.",
+        "ru": "📱 Пожалуйста, сначала отправьте свой номер телефона.",
+        "en": "📱 Please send your phone number first.",
+    },
+    "previous": {
+        "uz": "⬅️ Oldingi",
+        "ru": "⬅️ Передний",
+        "en": "⬅️ Previous",
+    },
+    "next": {
+        "uz": "➡️ Keyingi",
+        "ru": "➡️ Следующий",
+        "en": "➡️ Next",
+    },  
+    "select_list": {
+        "uz": "Iltimos, ro‘yxatdan bekat tanlang.",
+        "ru": "Пожалуйста, выберите остановку из списка.",
+        "en": "Please select a stop from the list.",
+    },
+    "select_stop": {
+        "uz": "Qayerga borasiz? (bekatni tanlang)",
+        "ru": "Куда вы идёте? (Выберите остановку)",
+        "en": "Where are you going? (select a stop)",
+    },
+    "select_first": {
+        "uz": "Avval ketish bekatini tanlang.",
+        "ru": "Сначала выберите остановку отправления.",
+        "en": "Select the departure stop first.",
+    },
+    "destination_station": {
+        "uz": "❌ Borish bekati ketish bekati bilan bir xil bo‘lmasin.",
+        "ru": "❌ Станция назначения не должна совпадать со станцией отправления.",
+        "en": "❌ The destination station should not be the same as the departure station.",
+    },
+    "nothing_found": {
+        "uz": "Hech narsa topilmadi. Yana yozing (misol: Toshkent, Samarqand).",
+        "ru": "Ничего не найдено. Напишите еще (пример: Ташкент, Самарканд).",
+        "en": "Nothing found. Write again (example: Tashkent, Samarkand).",
+    },
+    "select_keyboard": {
+        "uz": "Iltimos, keyboarddan tanlang.",
+        "ru": "Пожалуйста, выберите с клавиатуры.",
+        "en": "Please select from the keyboard.",
+    },
+    "wrong_choice": {
+        "uz": "Noto‘g‘ri tanlov. Qayta tanlang.",
+        "ru": "Неправильный выбор. Выберите ещё раз.",
+        "en": "Wrong choice. Please select again.",
+    },
+    "write_again": {
+        "uz": "Hech narsa topilmadi. Yana yozing (misol: Termiz, Nukus, Buxoro).",
+        "ru": "Ничего не найдено. Напишите еще (пример: Термез, Нукус, Бухара).",
+        "en": "Nothing found. Write again (example: Termez, Nukus, Bukhara).",
+    },
+    "select_data": {
+        "uz": "Sanani tugmadan tanlang (YYYY-MM-DD).",
+        "ru": "Выберите дату из кнопки (YYYY-MM-DD).",
+        "en": "Select the date from the button (YYYY-MM-DD).",
+    },
+    "end_start_data": {
+        "uz": "❌ Tugash sanasi boshlanish sanasidan oldin bo‘lmasin.",
+        "ru": "❌ Дата окончания не должна предшествовать дате начала.",
+        "en": "❌ End date must not be before start date.",
+    },
+    "start_search": {
+        "uz": "Endi qidiruvni boshlaymiz (keyingi qadam).",
+        "ru": "Теперь начнем поиск (следующий шаг).",
+        "en": "Now let's start searching (next step).",
+    },
+    "cancelled": {
+        "uz": "❌ Bekor qilindi.",
+        "ru": "❌ Отменено.",
+        "en": "❌ Cancelled.",
+    },
+    "please_select": {
+        "uz": "🗓 Iltimos, bugundan yoki keyingi sanadan tanlang:",
+        "ru": "🗓 Пожалуйста, выберите начиная с сегодняшнего или последующего дня:",
+        "en": "🗓 Please select from today or the following date:",
+    },
+    "select_first_data": {
+        "uz": "Avval boshlanish sanani tanlang.",
+        "ru": "Сначала выберите дату начала.",
+        "en": "Select the start date first.",
+    },
+    "maximum_3": {
+        "uz": "❌ Maksimal 3 kun tanlash mumkin.",
+        "ru": "❌ Вы можете выбрать максимум 3 дня.",
+        "en": "❌ You can choose a maximum of 3 days.",
+    },
+    "maximum_3_day": {
+        "uz": "🗓 Tugash sanani qayta tanlang (maksimal 3 kun).",
+        "ru": "🗓 Выберите дату окончания снова (максимум 3 дня).",
+        "en": "🗓 Please re-select the end date (maximum 3 days).",
+    },
+    "please_re_select": {
+        "uz": "🗓 Iltimos, tugash sanasini qayta tanlang:",
+        "ru": "🗓 Пожалуйста, выберите дату окончания снова:",
+        "en": "🗓 Please re-select the end date:",
+    },
+    "fallow_stopped": {
+        "uz": "⏹️ Kuzatish to‘xtatildi. \n""Qaytadan boshlash uchun: 📍 Yo'nalishni kiriting",
+        "ru": "⏹️ Отслеживание остановлено. Чтобы начать заново: 📍 Введите маршрут",
+        "en": "⏹️ Following stopped. \n To restart: 📍 Enter the direction",
+    },
+    "try_writing": {
+        "uz": "❌ Bekat topilmadi. Yana yozib ko‘ring.",
+        "ru": "❌ Остановка не найдена. Попробуйте написать ещё раз.",
+        "en": "❌ Stop not found. Try writing again.",
+    },
+    "continue_observe": {
+        "uz": "🔄 Kuzatishda davom etaman.",
+        "ru": "🔄 Продолжаю наблюдение.",
+        "en": "🔄 I will continue to observe.",
+    },
+    "change_detected": {
+        "uz": "🚨 O‘zgarish aniqlandi!",
+        "ru": "🚨 Обнаружены изменения!",
+        "en": "🚨 Change detected!",
+    },
+    "qwerty": {
+        "uz": "❌ Bekat topilmadi. Yana yozib ko‘ring.",
+        "ru": "❌ Остановка не найдена. Попробуйте написать ещё раз.",
+        "en": "❌ Stop not found. Try writing again.",
+    },
+    "qwerty": {
+        "uz": "❌ Bekat topilmadi. Yana yozib ko‘ring.",
+        "ru": "❌ Остановка не найдена. Попробуйте написать ещё раз.",
+        "en": "❌ Stop not found. Try writing again.",
+    },
+    "qwerty": {
+        "uz": "❌ Bekat topilmadi. Yana yozib ko‘ring.",
+        "ru": "❌ Остановка не найдена. Попробуйте написать ещё раз.",
+        "en": "❌ Stop not found. Try writing again.",
+    },
+    "qwerty": {
+        "uz": "❌ Bekat topilmadi. Yana yozib ko‘ring.",
+        "ru": "❌ Остановка не найдена. Попробуйте написать ещё раз.",
+        "en": "❌ Stop not found. Try writing again.",
+    },
+    "qwerty": {
+        "uz": "❌ Bekat topilmadi. Yana yozib ko‘ring.",
+        "ru": "❌ Остановка не найдена. Попробуйте написать ещё раз.",
+        "en": "❌ Stop not found. Try writing again.",
+    },
+}
+
+# --- MAIN MENU TEXTS (3 til) ---
+ROUTE_TEXTS = {BTN["route"]["uz"], BTN["route"]["ru"], BTN["route"]["en"]}
+CONTACT_TEXTS = {BTN["contact"]["uz"], BTN["contact"]["ru"], BTN["contact"]["en"]}
+LANG_TEXTS = {BTN["lang"]["uz"], BTN["lang"]["ru"], BTN["lang"]["en"]}
+FEEDBACK_TEXTS = {BTN["feedback"]["uz"], BTN["feedback"]["ru"], BTN["feedback"]["en"]}
+BACK_TEXTS = {BTN["back"]["uz"], BTN["back"]["ru"], BTN["back"]["en"]}
+
+MENU_PATTERN = r"^(" + "|".join(map(re.escape, sorted(
+    ROUTE_TEXTS | CONTACT_TEXTS | LANG_TEXTS | FEEDBACK_TEXTS | BACK_TEXTS
+))) + r")$"
+
+
+async def menu_router(update, context):
+    txt = (update.effective_message.text or "").strip()
+
+    if txt in ROUTE_TEXTS:
+        await start_route(update, context)
+        return
+
+    if txt in CONTACT_TEXTS:
+        await contact_handler(update, context)
+        return
+
+    if txt in LANG_TEXTS:
+        await lang_handler(update, context)
+        return
+
+    if txt in FEEDBACK_TEXTS:
+        await feedback_handler(update, context)
+        return
+
+    if txt in BACK_TEXTS:
+        await back_to_main(update, context)
+        return
+
+
+def _lang_norm(lang: str | None) -> str:
+    lang = (lang or "uz").lower()
+    return lang if lang in ("uz", "ru", "en") else "uz"
+
+async def get_lang(update: Update, context) -> str:
+    # tezkor cache: context.user_data["lang"]
+    if context.user_data.get("lang"):
+        return _lang_norm(context.user_data["lang"])
+    chat_id = update.effective_chat.id if update and update.effective_chat else None
+    if not chat_id:
+        return "uz"
+    lang = await get_user_lang(DB_PATH, chat_id)
+    context.user_data["lang"] = _lang_norm(lang)
+    return context.user_data["lang"]
+
+def t(lang: str, key: str, **kw) -> str:
+    lang = _lang_norm(lang)
+    raw = (TEXT.get(key, {}) or {}).get(lang) or (TEXT.get(key, {}) or {}).get("uz") or key
+    try:
+        return raw.format(**kw)
+    except Exception:
+        return raw
+
+def b(lang: str, key: str) -> str:
+    lang = _lang_norm(lang)
+    return (BTN.get(key, {}) or {}).get(lang) or (BTN.get(key, {}) or {}).get("uz") or key
+
+def kb_phone(lang: str):
     return ReplyKeyboardMarkup(
-        [["📍 Yo'nalishni kiritish"]],
+        [[KeyboardButton(b(lang, "send_phone"), request_contact=True)]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
+def kb_main(lang: str):
+    return ReplyKeyboardMarkup(
+        [
+            [b(lang, "route"), b(lang, "contact")],
+            [b(lang, "lang"), b(lang, "feedback")],
+        ],
         resize_keyboard=True
     )
 
-def kb_watch_controls():
+def kb_back(lang: str):
+    return ReplyKeyboardMarkup([[b(lang, "back")]], resize_keyboard=True)
+
+def kb_watch(lang: str):
+    # sizda /watch yo'q, faqat /now /stop qoldi
     return ReplyKeyboardMarkup(
         [
-            ["/stop — Kuzatishni to'xtatish"],
-            ["/now — Mavjud chiptalarni ko'rish"],
+            [b(lang, "check_now")],
+            [b(lang, "stop_track")],
+        ],
+        resize_keyboard=True
+    )
+
+def kb_watch_controls(lang: str):
+    return ReplyKeyboardMarkup(
+        [
+            [b(lang, "check_now")],
+            [b(lang, "stop_track")],
         ],
         resize_keyboard=True
     )
@@ -102,16 +569,16 @@ def _extract_seats_by_train(api: dict) -> dict:
     except Exception:
         trains = []
 
-    for t in trains:
-        num = (t.get("number") or "").strip()
+    for trn in trains:
+        num = (trn.get("number") or "").strip()
         if not num:
             continue
 
-        dep_name = t.get("originRoute", {}).get("depStationName") or t.get("subRoute", {}).get("depStationName") or ""
-        arv_name = t.get("originRoute", {}).get("arvStationName") or t.get("subRoute", {}).get("arvStationName") or ""
+        dep_name = trn.get("originRoute", {}).get("depStationName") or trn.get("subRoute", {}).get("depStationName") or ""
+        arv_name = trn.get("originRoute", {}).get("arvStationName") or trn.get("subRoute", {}).get("arvStationName") or ""
 
         cars_map = {}
-        for c in (t.get("cars") or []):
+        for c in (trn.get("cars") or []):
             ctype = (c.get("type") or "").strip() or "Unknown"
             free = int(c.get("freeSeats") or 0)
 
@@ -138,8 +605,30 @@ def _extract_seats_by_train(api: dict) -> dict:
 
     return out
 
+async def lang_callback(update, context):
+    lang = await get_lang(update, context)
+    query = update.callback_query
+    await query.answer()
 
-def _diff_trains(old_api: dict, new_api: dict) -> list[str]:
+    data = query.data or ""
+    # LANG|uz
+    parts = data.split("|", 1)
+    if len(parts) != 2:
+        return
+
+    new_lang = _lang_norm(parts[1])
+    chat_id = query.message.chat_id
+
+    await set_user_lang(DB_PATH, chat_id, new_lang)
+    context.user_data["lang"] = new_lang
+    # 🔥 eng muhim qator: eski jarayonlarni bekor qiladi
+    context.user_data["step"] = None
+
+    await query.edit_message_text(t(new_lang, "lang_saved"))
+    await query.message.reply_text(t(new_lang, "main_home"), reply_markup=kb_main(new_lang))
+
+
+def _diff_trains(old_api: dict, new_api: dict, lang: str) -> list[str]:
     """
     Matnlar ro'yxati qaytaradi. Har bir element — bitta o‘zgarish satri.
     """
@@ -153,16 +642,16 @@ def _diff_trains(old_api: dict, new_api: dict) -> list[str]:
         if num not in old:
             # yangi poezd paydo bo'ldi
             meta = new[num]["meta"]
-            lines.append(f"🚆 {num}  {meta.get('from','')} → {meta.get('to','')}\n  🆕 Yangi poezd paydo bo‘ldi")
+            lines.append(f"🚆 {num}  {meta.get('from','')} → {meta.get('to','')}\n  {t(lang, "new_train")}")
             # carlarni ham sanab o‘tamiz
             for ctype, info in new[num]["cars"].items():
-                price = f"{info['tariff']} so‘m" if info.get("tariff") else "-"
-                lines.append(f"  {ctype}: {info['free']} ta — {price}")
+                price = f"{info['tariff']} {t(lang, "currency")}" if info.get("tariff") else "-"
+                lines.append(f"  {ctype}: {info['free']} {t(lang, "item")} — {price}")
             continue
 
         if num not in new:
             meta = old[num]["meta"]
-            lines.append(f"🚆 {num}  {meta.get('from','')} → {meta.get('to','')}\n  🗑 Poezd ro‘yxatdan yo‘qoldi")
+            lines.append(f"🚆 {num}  {meta.get('from','')} → {meta.get('to','')}\n  {t(lang, "delete_list")}")
             continue
 
         meta = new[num]["meta"] or old[num]["meta"]
@@ -175,12 +664,12 @@ def _diff_trains(old_api: dict, new_api: dict) -> list[str]:
         for ctype in sorted(all_car_types):
             if ctype not in old_cars:
                 info = new_cars[ctype]
-                price = f"{info['tariff']} so‘m" if info.get("tariff") else "-"
-                per_train_lines.append(f"  🆕 {ctype}: {info['free']} ta — {price} (yangi vagon turi)")
+                price = f"{info['tariff']} {t(lang, "currency")}" if info.get("tariff") else "-"
+                per_train_lines.append(f"  🆕 {ctype}: {info['free']} {t(lang, "item")} — {price} ({t(lang, "new_type")})")
                 continue
 
             if ctype not in new_cars:
-                per_train_lines.append(f"  🗑 {ctype}: vagon turi yo‘qoldi")
+                per_train_lines.append(f"  🗑 {ctype}: {t(lang, "type_lost")}")
                 continue
 
             o = old_cars[ctype]["free"]
@@ -190,12 +679,12 @@ def _diff_trains(old_api: dict, new_api: dict) -> list[str]:
 
             delta = n - o
             info = new_cars[ctype]
-            price = f"{info['tariff']} so‘m" if info.get("tariff") else "-"
+            price = f"{info['tariff']} {t(lang, "currency")}" if info.get("tariff") else "-"
 
             if delta < 0:
-                per_train_lines.append(f"  {ctype}: {n} ta — {price} ({abs(delta)} ta belit sotildi)")
+                per_train_lines.append(f"  {ctype}: {n} {t(lang, "item")} — {price} ({abs(delta)} {t(lang, "item")} {t(lang, "belite_sold")})")
             else:
-                per_train_lines.append(f"  {ctype}: {n} ta — {price} (+{delta} ta qo‘shildi)")
+                per_train_lines.append(f"  {ctype}: {n} {t(lang, "item")} — {price} (+{delta} {t(lang, "item")} {t(lang, "belite_add")})")
 
         if per_train_lines:
             lines.append(f"🚆 {num}  {meta.get('from','')} → {meta.get('to','')}")
@@ -203,7 +692,7 @@ def _diff_trains(old_api: dict, new_api: dict) -> list[str]:
 
     return lines
 
-def _watch_day_report(old_api: dict, new_api: dict) -> str:
+def _watch_day_report(old_api: dict, new_api: dict, lang: str) -> str:
     """
     Watcher uchun 1 kunlik report:
     - tepa/past ko‘rsatadi (SV bo‘lsa yashiradi)
@@ -234,7 +723,7 @@ def _watch_day_report(old_api: dict, new_api: dict) -> str:
 
         idx += 1
         out.append(f"🚆 #{idx}:  {num}  {full_from} → {full_to}")
-        out.append(f"📋 Bo‘sh o‘rinlar : {total_now} ta joy")
+        out.append(f"{t(lang, "available_place")} {total_now} {t(lang, "item")} {t(lang, "place")}")
 
         for ctype in sorted(new_cars.keys()):
             now = new_cars.get(ctype) or {}
@@ -252,27 +741,32 @@ def _watch_day_report(old_api: dict, new_api: dict) -> str:
 
             # SV bo‘lsa tepa/pastni yashiramiz
             low = (ctype or "").lower()
-            is_sv = ("sv" == low) or (" sv" in low) or ("св" in low) or ("sleeper" in low)
+            is_sv = ("sv" == low) or (" sv" in low) or ("св" in low)
             # ✅ Umumiyda tepa/past bo‘lmaydi — yashiramiz
             is_umumiy = ("umumiy" in low) or ("общ" in low) or ("general" in low)
 
             sign = ""
             if delta != 0:
-                sign = f"(➕{delta})" if delta > 0 else f"(➖{(-1)*delta})"
+                sign = f"(➕{delta})" if delta > 0 else f"(➖{abs(delta)})"
 
             if is_sv or is_umumiy:
                 # SV: faqat son
                 if delta == 0:
-                    out.append(f"• {ctype} : {now_free} ta joy")
+                    out.append(f"• {ctype} : {now_free} {t(lang, "item")} {t(lang, "place")}")
                 else:
-                    out.append(f"• {ctype} {sign} : {now_free} ta joy")
+                    out.append(f"• {ctype} {sign} : {now_free} {t(lang, "item")} {t(lang, "place")}")
             else:
+                # boshqalar: tepa/past FAQAT mavjud bo'lsa ko'rsatamiz
+                show_ud = (now_up + now_down) > 0
+
+                ud_text = ""
+                if show_ud:
+                    ud_text = f" ({t(lang, 'high')} {now_up} {t(lang, 'item')}, {t(lang, 'lower')} {now_down} {t(lang, 'item')})"
                 # boshqalar: tepa/past bilan
                 if delta == 0:
-                    out.append(f"• {ctype} : {now_free} ta joy (Tepa {now_up} ta, Pastki {now_down} ta)")
+                    out.append(f"• {ctype} : {now_free} {t(lang, 'item')} {t(lang, 'place')}{ud_text}")
                 else:
-                    out.append(f"• {ctype} {sign} : {now_free} ta joy (Tepa {now_up} ta, Pastki {now_down} ta)")
-
+                    out.append(f"• {ctype} {sign} : {now_free} {t(lang, 'item')} {t(lang, 'place')}{ud_text}")
         out.append("")
 
     return "\n".join(out).strip()
@@ -287,33 +781,33 @@ def fmt_date_obj(d: date) -> str:
     except Exception:
         return str(d)
 
-def diff(prev: dict, cur: dict) -> list[str]:
+def diff(prev: dict, cur: dict, lang: str) -> list[str]:
     lines = []
 
     for train_key in cur.keys():
         if train_key not in prev:
-            lines.append(f"➕ Yangi poezd: {train_key}")
+            lines.append(f"➕ {t(lang, "new_train")} {train_key}")
 
     for train_key in prev.keys():
         if train_key not in cur:
-            lines.append(f"➖ Poezd yo‘qoldi: {train_key}")
+            lines.append(f"➖ {t(lang, "train_lost")} {train_key}")
 
     for train_key, cur_cars in cur.items():
         prev_cars = prev.get(train_key, {})
 
         for car_type in cur_cars.keys():
             if car_type not in prev_cars:
-                lines.append(f"➕ Yangi vagon: {train_key} — {car_type} (free={cur_cars[car_type]['freeSeats']})")
+                lines.append(f"➕ {t(lang, "new_train1")} {train_key} — {car_type} (free={cur_cars[car_type]['freeSeats']})")
 
         for car_type, cur_info in cur_cars.items():
             if car_type in prev_cars:
-                a = int(prev_cars[car_type].get("freeSeats") or 0)
-                b = int(cur_info.get("freeSeats") or 0)
-                if b != a:
-                    arrow = "📈" if b > a else "📉"
-                    t = cur_info.get("tariff")
-                    tariff_txt = f", tariff={t}" if t is not None else ""
-                    lines.append(f"{arrow} Joy o‘zgardi: {train_key} — {car_type} {a} → {b}{tariff_txt}")
+                A = int(prev_cars[car_type].get("freeSeats") or 0)
+                B = int(cur_info.get("freeSeats") or 0)
+                if B != A:
+                    arrow = "📈" if B > A else "📉"
+                    tariff = cur_info.get("tariff")
+                    tariff_txt = f", tariff={tariff}" if tariff is not None else ""
+                    lines.append(f"{arrow} {t(lang, 'plase_change')} {train_key} — {car_type} {A} → {B}{tariff_txt}")
 
     return lines
 
@@ -329,7 +823,7 @@ def save_state(state: dict):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
-def build_date_keyboard(days=14):
+def build_date_keyboard(lang: str, days=14):
     today = date.today()
     items = []
     for i in range(days):
@@ -338,7 +832,7 @@ def build_date_keyboard(days=14):
 
     # 2 tadan qilib chiqamiz
     keyboard = [items[i:i+2] for i in range(0, len(items), 2)]
-    keyboard.append(["🔙 Orqaga"])
+    keyboard.append(t(lang, "back"))
     return keyboard
 
 CAL_PREFIX = "CAL"  # callback_data prefiks
@@ -347,7 +841,7 @@ def _cal_cb(action: str, mode: str, y: int, m: int, d: int = 0) -> str:
     # action: NAV | DAY | IGN
     return f"{CAL_PREFIX}|{action}|{mode}|{y:04d}-{m:02d}|{d:02d}"
 
-def build_calendar(year: int, month: int, mode: str) -> InlineKeyboardMarkup:
+def build_calendar(year: int, month: int, mode: str, lang: str) -> InlineKeyboardMarkup:
     """
     mode = 'from' yoki 'to'
     """
@@ -387,7 +881,7 @@ def build_calendar(year: int, month: int, mode: str) -> InlineKeyboardMarkup:
         rows.append(row)
 
     # Footer
-    rows.append([InlineKeyboardButton("❌ Bekor qilish", callback_data=_cal_cb("CANCEL", mode, year, month))])
+    rows.append([InlineKeyboardButton(t(lang, "cancel"), callback_data=_cal_cb("CANCEL", mode, year, month))])
 
 
     return InlineKeyboardMarkup(rows)
@@ -396,6 +890,7 @@ from telegram import ReplyKeyboardRemove
 from telegram.error import BadRequest
 
 async def send_calendar(update, context, mode: str):
+    lang = await get_lang(update, context)
     """
     mode: 'from' (boshlanish) yoki 'to' (tugash)
     """
@@ -403,8 +898,8 @@ async def send_calendar(update, context, mode: str):
     context.user_data["cal_mode"] = mode
     context.user_data["cal_ym"] = f"{today.year:04d}-{today.month:02d}"
 
-    caption = "🗓 Boshlanish sanasini tanlang:" if mode == "from" else "🗓 Tugash sanasini tanlang:"
-    markup = build_calendar(today.year, today.month, mode)
+    caption = t(lang, "choose_start_data") if mode == "from" else t(lang, "choose_end_data")
+    markup = build_calendar(today.year, today.month, mode, lang)
 
     # ✅ 1) Reply keyboardni yashiramiz (xabarni keyin o‘chirib tashlaymiz)
     try:
@@ -426,50 +921,49 @@ async def send_calendar(update, context, mode: str):
         await update.callback_query.message.reply_text(caption, reply_markup=markup)
 
 
-async def check_and_notify(app: Application, chat_id: int):
+async def check_and_notify(app: Application, chat_id: int, lang: str):
     api = await fetch_trains(DEP, ARV, DATE)
     cur = make_summary(api)
 
     prev = load_state()
     if prev is None:
         save_state(cur)
-        await app.bot.send_message(chat_id=chat_id, text="✅ Birinchi ishga tushdi. Holat saqlandi, kuzatish boshlandi.")
+        await app.bot.send_message(chat_id=chat_id, text=t(lang, "first_start"))
         return
 
     changes = diff(prev, cur)
     if changes:
         save_state(cur)
-        msg = "🚆 Yangilik topildi!\n\n" + "\n".join(changes)
+        msg = f"{t(lang, "new_found")}\n\n" + "\n".join(changes)
         await app.bot.send_message(chat_id=chat_id, text=msg[:3500])
 
-async def start(update, context):
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = await get_lang(update, context)
     chat_id = update.effective_chat.id
+    u = update.effective_user
 
-    # 0) Avval DB’dan tekshiramiz (restart bo‘lsa ham ishlaydi)
-    db_phone = await get_phone(DB_PATH, chat_id)
-    if db_phone:
-        # cache qilib qo'yamiz (keyingi joylarda qulay)
-        context.user_data["phone"] = db_phone
+    # ✅ /start bosilganda eski kuzatuvni to'xtatamiz (/stop kabi)
+    await save_watch(DB_PATH, chat_id, {"enabled": False})
 
-        # ✅ qo‘shiladi
-        reset_flow_keep_phone(context)
-        await clear_watch_everything(context, chat_id)
+    # ✅ eski flow holatlarini tozalaymiz
+    context.user_data["step"] = None
+    for k in ("dep_code", "arv_code", "dep_name", "arv_name", "date_from", "date_to", "station_items", "station_page"):
+        context.user_data.pop(k, None)
 
-        first = (update.effective_user.first_name or "Birodar").strip()
-        await update.effective_message.reply_text(
-            f"Salom, {first}!\n"
-            "Men O‘zbekiston temir yo‘l poyezd chiptalaridagi o‘zgarishlarni kuzataman va sizga habar beraman.\n\n"
-            "Yo‘nalishni tanlang 👇",
-            reply_markup=MAIN_KB
-        )
-        return
+    # DB user upsert + last_seen
+    await upsert_user(DB_PATH, chat_id, u.id if u else None, u.username if u else None,
+                      u.first_name if u else None, u.last_name if u else None)
 
-    # 1) DB’da ham yo‘q bo‘lsa — birinchi marta (faqat /start’da so‘raydi)
-    await update.effective_message.reply_text("Poyezd Chiptalari Kuzatuvchi botiga xush kelibsiz!")
+    lang = await get_user_lang(DB_PATH, chat_id)
+    context.user_data["lang"] = lang
+
+    first = (u.first_name or t(lang, "comrade")).strip() if u else t(lang, "comrade")
+
     await update.effective_message.reply_text(
-        "📱 Iltimos, telefon raqamingizni yuboring yoki tugmadan foydalaning.",
-        reply_markup=PHONE_KB
+        t(lang, "start_hi", first=first),
+        reply_markup=kb_main(lang)
     )
+
 
 async def need_phone(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> bool:
     if context.user_data.get("phone"):
@@ -527,11 +1021,12 @@ async def clear_watch_everything(context: ContextTypes.DEFAULT_TYPE, chat_id: in
 
 
 async def phone_contact_handler(update, context):
+    lang = await get_lang(update, context)
     contact = update.effective_message.contact
     if not contact or not contact.phone_number:
         await update.effective_message.reply_text(
-            "📱 Iltimos, pastdagi tugma orqali telefon raqamingizni yuboring.",
-            reply_markup=PHONE_KB
+            t(lang, "ask_phone"),
+            reply_markup=kb_phone(lang)
         )
         return
 
@@ -545,20 +1040,19 @@ async def phone_contact_handler(update, context):
     await set_phone(DB_PATH, update.effective_chat.id, phone)
 
     await update.effective_message.reply_text(
-        "Telefon raqamingiz qabul qilindi ✅",
+        t(lang, "phone_ok"),
         reply_markup=ReplyKeyboardRemove()
     )
 
-    first = (update.effective_user.first_name or "Birodar").strip()
+    first = (update.effective_user.first_name or t(lang, "comrade")).strip()
     await update.effective_message.reply_text(
-        f"Salom, {first}!\n"
-        "Men O‘zbekiston temir yo‘l poyezd chiptalaridagi o‘zgarishlarni kuzataman va sizga habar beraman.\n\n"
-        "Yo‘nalishni tanlang 👇",
-        reply_markup=MAIN_KB
+        t(lang, "start_hi"),
+        reply_markup=kb_main(lang)
     )
 
 
 async def watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = await get_lang(update, context)
     chat_id = update.effective_chat.id
     await set_watch_enabled(DB_PATH, chat_id, True)
 
@@ -566,78 +1060,80 @@ async def watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ Kuzatish yoqildi. Har {POLL_SECONDS} soniyada tekshiraman.\n"
         "📍 Yo‘nalish/sana tanlangan bo‘lsa — avtomatik ishlaydi.\n"
         "Agar hali tanlanmagan bo‘lsa, qidiruv qiling.",
-        reply_markup=WATCH_KB
+        reply_markup=kb_watch(lang)
     )
 
 
 
 async def start_route(update, context):
+    lang = await get_lang(update, context)
     if await need_phone(context, update.effective_chat.id):
         await update.effective_message.reply_text(
-            "📱 Avval telefon raqamingizni yuboring.",
-            reply_markup=PHONE_KB
+            t(lang, "sent_phone_first"),
+            reply_markup=kb_phone(lang)
         )
         return
     reset_flow_keep_phone(context)
     context.user_data["step"] = "dep_query"
 
     await update.effective_message.reply_text(
-        "Qayerdan ketasiz? (Bekatni yozing. Misol uchun: Toshkent)",
+        t(lang,"leaving_from"),
         reply_markup=ReplyKeyboardRemove()
     )
 
 
 async def back_to_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = await get_lang(update, context)
     chat_id = update.effective_chat.id
     reset_flow_keep_phone(context)
 
     if await has_active_watch_db(chat_id):
-        await update.effective_message.reply_text("Bosh sahifa", reply_markup=kb_watch_controls())
+        await update.effective_message.reply_text(t(lang, "main_home"), reply_markup=kb_watch_controls())
     else:
-        await update.effective_message.reply_text("Bosh sahifa", reply_markup=kb_route_only())
+        await update.effective_message.reply_text(t(lang, "main_home"), reply_markup=kb_main(lang))
 
-
-def _stations_keyboard(items: list[dict], page: int = 0, per_page: int = 10):
+def _stations_keyboard(lang: str, items: list, page: int = 0, page_size: int = 8):
     """
-    items: [{"code","name"}]
-    tugma matni: NAME | CODE
+    items: [{"name":"Toshkent","code":"2900000"}, ...] yoki sizning format
     """
-    start = page * per_page
-    chunk = items[start:start + per_page]
+    from telegram import ReplyKeyboardMarkup
 
-    keyboard = []
+    if not items:
+        return ReplyKeyboardMarkup([[b(lang, "back")]], resize_keyboard=True)
+
+    total = len(items)
+    pages = max(1, (total + page_size - 1) // page_size)
+    page = max(0, min(page, pages - 1))
+
+    start = page * page_size
+    end = start + page_size
+    chunk = items[start:end]
+
+    rows = []
     for s in chunk:
-        keyboard.append([f"{s['name']}"])
+        name = s.get("name") or ""
+        code = s.get("code") or ""
+        # sizda tanlash formati NAME (CODE) bo‘lsa:
+        rows.append([f"{name}"])
 
     nav = []
     if page > 0:
-        nav.append("⬅️ Oldingi")
-    if start + per_page < len(items):
-        nav.append("➡️ Keyingi")
+        nav.append(b(lang, "previous"))
+    if page < pages - 1:
+        nav.append(b(lang, "next"))
     if nav:
-        keyboard.append(nav)
+        rows.append(nav)
 
-    keyboard.append(["🔙 Orqaga"])
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-
-
-# def _parse_station_choice(text: str):
-#     """
-#     'TASHKENT | 2900000' -> ('TASHKENT','2900000')
-#     """
-#     if "|" not in text:
-#         return None, None
-#     name, code = [x.strip() for x in text.split("|", 1)]
-#     if not code.isdigit():
-#         return None, None
-#     return name, code
+    rows.append([b(lang, "back")])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 
 async def choose_dep(update, context):
+    lang = await get_lang(update, context)
     dep = update.message.text.strip()
 
     if dep not in STATIONS:
-        await update.effective_message.reply_text("Iltimos, ro‘yxatdan bekat tanlang.")
+        await update.effective_message.reply_text(t(lang, "select_list"))
         return
 
     context.user_data["dep"] = dep
@@ -646,27 +1142,28 @@ async def choose_dep(update, context):
     # borish ro'yxati: depni olib tashlaymiz
     arv_list = [s for s in STATIONS if s != dep]
     keyboard = [arv_list[i:i+2] for i in range(0, len(arv_list), 2)]
-    keyboard.append(["🔙 Orqaga"])
+    keyboard.append([t(lang, "back")])
 
     await update.effective_message.reply_text(
-        "Qayerga borasiz? (bekatni tanlang)",
+        t(lang, "select_stop"),
         reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     )
 
 async def choose_arv(update, context):
+    lang = await get_lang(update, context)
     arv = update.message.text.strip()
 
     if arv not in STATIONS:
-        await update.effective_message.reply_text("Iltimos, ro‘yxatdan bekat tanlang.")
+        await update.effective_message.reply_text(t(lang, "select_list"))
         return
 
     dep = context.user_data.get("dep")
     if not dep:
-        await update.effective_message.reply_text("Avval ketish bekatini tanlang.")
+        await update.effective_message.reply_text(t(lang, "select_first"))
         return
 
     if arv == dep:
-        await update.effective_message.reply_text("Borish bekati ketish bekati bilan bir xil bo‘lmasin.")
+        await update.effective_message.reply_text(t(lang, "destination_station"))
         return
 
     context.user_data["arv"] = arv
@@ -676,16 +1173,17 @@ async def choose_arv(update, context):
 
 
 async def dep_query(update, context):
+    lang = await get_lang(update, context)
     text = (update.message.text or "").strip()
 
-    if text == "🔙 Orqaga":
+    if text == t(lang, "back"):
         return
 
     # qidiruv
     stations = await search_stations(text)
     if not stations:
         await update.effective_message.reply_text(
-            "Hech narsa topilmadi. Yana yozing (misol: Toshkent, Samarqand)."
+            t(lang, "nothing_found")
         )
         return
 
@@ -694,48 +1192,49 @@ async def dep_query(update, context):
     context.user_data["step"] = "dep_select"
 
     await update.effective_message.reply_text(
-        "Topilgan bekatlardan birini tanlang:",
-        reply_markup=_stations_keyboard(stations, page=0)
+        t(lang, "choose_station"),
+        reply_markup=_stations_keyboard(lang, stations, page=0)
     )
 
 
 async def dep_select(update, context):
+    lang = await get_lang(update, context)
     text = (update.message.text or "").strip()
 
-    if text == "🔙 Orqaga":
+    if text == t(lang, "back"):
         return
 
     stations = context.user_data.get("dep_candidates") or []
     page = int(context.user_data.get("dep_page") or 0)
 
-    if text == "➡️ Keyingi":
+    if text == t(lang, "next"):
         page += 1
         context.user_data["dep_page"] = page
         await update.effective_message.reply_text(
-            "Topilgan bekatlardan birini tanlang:",
-            reply_markup=_stations_keyboard(stations, page=page)
+            t(lang, "choose_station"),
+            reply_markup=_stations_keyboard(lang, stations, page=page)
         )
         return
 
-    if text == "⬅️ Oldingi":
+    if text == t(lang, "previous"):
         page = max(0, page - 1)
         context.user_data["dep_page"] = page
         await update.effective_message.reply_text(
-            "Topilgan bekatlardan birini tanlang:",
-            reply_markup=_stations_keyboard(stations, page=page)
+            t(lang, "choose_station"),
+            reply_markup=_stations_keyboard(lang, stations, page=page)
         )
         return
 
     # format: NAME (CODE)
     if "(" not in text or ")" not in text:
-        await update.effective_message.reply_text("Iltimos, keyboarddan tanlang.")
+        await update.effective_message.reply_text(t(lang, "select_keyboard"))
         return
 
     code = text.split("(")[-1].split(")")[0].strip()
     name = text.split("(")[0].strip()
 
     if not code.isdigit():
-        await update.effective_message.reply_text("Noto‘g‘ri tanlov. Qayta tanlang.")
+        await update.effective_message.reply_text(t(lang, "wrong_choice"))
         return
 
     context.user_data["dep"] = name
@@ -744,21 +1243,22 @@ async def dep_select(update, context):
     # endi borish bekati
     context.user_data["step"] = "arv_query"
     await update.effective_message.reply_text(
-        "Qayerga borasiz? (Bekatni yozing. Misol uchun: Termiz)",
+        t(lang, "go_to"),
         reply_markup=ReplyKeyboardRemove()
     )
 
 
 async def arv_query(update, context):
+    lang = await get_lang(update, context)
     text = (update.message.text or "").strip()
 
-    if text == "🔙 Orqaga":
+    if text == t(lang, "back"):
         return
 
     stations = await search_stations(text)
     if not stations:
         await update.effective_message.reply_text(
-            "Hech narsa topilmadi. Yana yozing (misol: Termiz, Nukus, Buxoro)."
+            t(lang, "write_again")
         )
         return
 
@@ -771,47 +1271,48 @@ async def arv_query(update, context):
     context.user_data["step"] = "arv_select"
 
     await update.effective_message.reply_text(
-        "Topilgan bekatlardan birini tanlang:",
-        reply_markup=_stations_keyboard(stations, page=0)
+        t(lang, "choose_station"),
+        reply_markup=_stations_keyboard(lang, stations, page=0)
     )
 
 
 async def arv_select(update, context):
+    lang = await get_lang(update, context)
     text = (update.message.text or "").strip()
 
-    if text == "🔙 Orqaga":
+    if text == t(lang, "back"):
         return
 
     stations = context.user_data.get("arv_candidates") or []
     page = int(context.user_data.get("arv_page") or 0)
 
-    if text == "➡️ Keyingi":
+    if text == t(lang, "next"):
         page += 1
         context.user_data["arv_page"] = page
         await update.effective_message.reply_text(
-            "Topilgan bekatlardan birini tanlang:",
-            reply_markup=_stations_keyboard(stations, page=page)
+            t(lang, "choose_station"),
+            reply_markup=_stations_keyboard(lang, stations, page=page)
         )
         return
 
-    if text == "⬅️ Oldingi":
+    if text == t(lang, "previous"):
         page = max(0, page - 1)
         context.user_data["arv_page"] = page
         await update.effective_message.reply_text(
-            "Topilgan bekatlardan birini tanlang:",
-            reply_markup=_stations_keyboard(stations, page=page)
+            t(lang, "choose_station"),
+            reply_markup=_stations_keyboard(lang, stations, page=page)
         )
         return
 
     if "(" not in text or ")" not in text:
-        await update.effective_message.reply_text("Iltimos, keyboarddan tanlang.")
+        await update.effective_message.reply_text(t(lang, "select_keyboard"))
         return
 
     code = text.split("(")[-1].split(")")[0].strip()
     name = text.split("(")[0].strip()
 
     if not code.isdigit():
-        await update.effective_message.reply_text("Noto‘g‘ri tanlov. Qayta tanlang.")
+        await update.effective_message.reply_text(t(lang, "wrong_choice"))
         return
 
     context.user_data["arv"] = name
@@ -825,12 +1326,13 @@ async def arv_select(update, context):
 
 
 async def choose_date_from(update, context):
+    lang = await get_lang(update, context)
     text = update.message.text.strip()
 
     try:
         date.fromisoformat(text)
     except ValueError:
-        await update.effective_message.reply_text("Sanani tugmadan tanlang (YYYY-MM-DD).")
+        await update.effective_message.reply_text(t(lang, "select_data"))
         return
 
     context.user_data["date_from"] = text
@@ -842,19 +1344,20 @@ async def choose_date_from(update, context):
     )
 
 async def choose_date_to(update, context):
+    lang = await get_lang(update, context)
     text = update.message.text.strip()
 
     try:
         to_d = date.fromisoformat(text)
     except ValueError:
-        await update.effective_message.reply_text("Sanani tugmadan tanlang (YYYY-MM-DD).")
+        await update.effective_message.reply_text(t(lang, "select_data"))
         return
 
     from_text = context.user_data.get("date_from")
     from_d = date.fromisoformat(from_text)
 
     if to_d < from_d:
-        await update.effective_message.reply_text("Tugash sanasi boshlanish sanasidan oldin bo‘lmasin.")
+        await update.effective_message.reply_text(t(lang, "end_start_data"))
         return
 
     context.user_data["date_to"] = text
@@ -867,7 +1370,7 @@ async def choose_date_to(update, context):
         f"✅ Tanlandi:\n"
         f"📍 {dep} → {arv}\n"
         f"🗓 {from_text} .. {text}\n\n"
-        f"Endi qidiruvni boshlaymiz (keyingi qadam)."
+        f"{t(lang, "start_search")}"
     )
 
 
@@ -891,6 +1394,7 @@ async def _safe_edit_markup(query, reply_markup):
 
 
 async def calendar_handler(update, context):
+    lang = await get_lang(update, context)
     query = update.callback_query
     data = query.data or ""
     if not data.startswith(CAL_PREFIX + "|"):
@@ -913,7 +1417,7 @@ async def calendar_handler(update, context):
 
     # NAV: oy almashtirish
     if action == "NAV":
-        await _safe_edit_markup(query, build_calendar(y, m, mode))
+        await _safe_edit_markup(query, build_calendar(y, m, mode, lang))
         return
 
     if action == "CANCEL":
@@ -921,7 +1425,7 @@ async def calendar_handler(update, context):
         context.user_data.pop("date_to", None)
         context.user_data["step"] = None
 
-        await _safe_edit_text(query,"❌ Bekor qilindi.")
+        await _safe_edit_text(query,t(lang, "cancelled"))
         # xohlasangiz asosiy menyu tugmalarini qaytarib qo'yamiz:
         reply_keyboard = [
             ["📍 Yo'nalishni kiritish"],
@@ -930,7 +1434,7 @@ async def calendar_handler(update, context):
             ["/stop — kuzatishni o‘chirish"]
         ]
         await query.message.reply_text(
-            "Asosiy menyu 👇",
+            t(lang, "main_home"),
             reply_markup=ReplyKeyboardMarkup(reply_keyboard, resize_keyboard=True)
         )
         return
@@ -948,14 +1452,14 @@ async def calendar_handler(update, context):
             if selected_date < today:
                 # eski kalendarni yopamiz
                 try:
-                    await _safe_edit_text(query, "❌ Boshlanish sana bugundan oldin bo‘lishi mumkin emas.")
+                    await _safe_edit_text(query, t(lang, "start_data"))
                 except Exception:
                     pass
 
                 # yangi xabar + kalendar
                 await query.message.reply_text(
-                    "🗓 Iltimos, bugundan yoki keyingi sanadan tanlang:",
-                    reply_markup=build_calendar(today.year, today.month, "from")
+                    t(lang, "please_select"),
+                    reply_markup=build_calendar(today.year, today.month, "from", lang)
                 )
                 return
 
@@ -976,13 +1480,13 @@ async def calendar_handler(update, context):
             
             # ✅ 2) TASDIQ XABARI (faqat shu qoladi)
             await query.message.chat.send_message(
-                f"✅ Boshlanish sana tanlandi: {fmt_date(selected)}"
+                f"{t(lang, "start_data")} {fmt_date(selected)}"
             )
 
             # ✅ 3) Tugash kalendarini chiqaramiz (1 marta)
             await query.message.chat.send_message(
-                "🗓 Tugash sanasini tanlang:",
-                reply_markup=build_calendar(y, m, "to")
+                t(lang, "choose_end_data"),
+                reply_markup=build_calendar(y, m, "to", lang)
             )
             return
 
@@ -992,7 +1496,7 @@ async def calendar_handler(update, context):
         if mode == "to":
             from_text = context.user_data.get("date_from")
             if not from_text:
-                await _safe_edit_text(query,"Avval boshlanish sanani tanlang.")
+                await _safe_edit_text(query,t(lang, "select_first_data"))
                 return
 
             from_d = date.fromisoformat(from_text)
@@ -1003,25 +1507,25 @@ async def calendar_handler(update, context):
             if (to_d - from_d).days > (MAX_DAYS - 1):
                 # Eski tugash kalendar xabarini yopamiz (xato yozuvi bilan)
                 try:
-                    await _safe_edit_text(query,"❌ Maksimal 3 kun tanlash mumkin.")
+                    await _safe_edit_text(query,t(lang, "maximum_3"))
                 except Exception:
                     pass
 
                 # Yangi xabar + yangi kalendar (qayta tanlash uchun)
                 await query.message.reply_text(
-                    "🗓 Tugash sanani qayta tanlang (maksimal 3 kun).",
-                    reply_markup=build_calendar(y, m, "to")
+                    t(lang, "maximum_3_day"),
+                    reply_markup=build_calendar(y, m, "to", lang)
                 )
                 return
 
             if to_d < from_d:
                 # 1) Bosilgan (eski) kalendar xabarini yopamiz
-                await _safe_edit_text(query, "❌ Tugash sanasi boshlanish sanasidan oldin bo‘lmasin.")
+                await _safe_edit_text(query, t(lang, "end_start_data"))
 
                 # 2) Yangi xato xabari + tagidan yangi kalendar
                 await query.message.reply_text(
-                    "🗓 Iltimos, tugash sanasini qayta tanlang:",
-                    reply_markup=build_calendar(y, m, "to")
+                    t(lang, "please_re_select"),
+                    reply_markup=build_calendar(y, m, "to", lang)
                 )
                 return
 
@@ -1045,7 +1549,7 @@ async def calendar_handler(update, context):
 
             # ✅ 1.1) Tugash sana tanlandi xabari (SIZ XOHlagan)
             await query.message.chat.send_message(
-                f"✅ Tugash sana tanlandi: {fmt_date(selected)}"
+                f"{t(lang, "end_data")} {fmt_date(selected)}"
             )
 
             from_text = context.user_data.get("date_from")
@@ -1060,10 +1564,10 @@ async def calendar_handler(update, context):
 
             # ✅ 2) Faqat bitta yakuniy xabar (oraliq “✅ Sana oralig‘i tanlandi.” yo‘q!)
             await query.message.chat.send_message(
-                "✅ Sana oralig‘i tanlandi!\n"
+                f"{t(lang, "interval_data")}\n"
                 f"{route_text}"
                 f"🗓 {fmt_date(from_text)} ⟷ {fmt_date(selected)}\n\n"
-                "Shu oraliqda qidiruv natijalarini chiqaramiz."
+                f"{t(lang, "interval_result")}"
             )
 
             await search_in_range_and_show(update, context)
@@ -1071,6 +1575,7 @@ async def calendar_handler(update, context):
 
         
 async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lang = await get_lang(update, context)
     chat_id = update.effective_chat.id
 
     # 1) RAM'dagi (user_data) hammasini tozalaymiz
@@ -1099,15 +1604,15 @@ async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     })
 
     await update.effective_message.reply_text(
-        "⏹ Kuzatish to‘xtatildi.\n"
-        "Qaytadan boshlash uchun: 📍 Yo'nalishni kiritish",
-        reply_markup=kb_route_only()
+        t(lang, "fallow_stopped"),
+        reply_markup=kb_main(lang)
     )
 
 
 
 async def now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    lang = context.user_data.get("lang") or await get_user_lang(DB_PATH, chat_id) or "uz"
     w = await get_watch(DB_PATH, chat_id)
 
     if (not w) or (not w.get("enabled")):
@@ -1130,19 +1635,29 @@ async def now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     dep_name = w.get("dep_name") or str(dep_code)
     arv_name = w.get("arv_name") or str(arv_code)
 
-    await update.effective_message.reply_text("🔎 Tekshiryapman...")
+    await update.effective_message.reply_text(t(lang, "searching"))
 
-    full_text = "🎟 Mavjud chiptalar:\n"
+    full_text = f"{t(lang, "available_tickets")}\n"
     full_text += f"📍 {dep_name} → {arv_name}\n"
     snapshot = {}
 
     for d in iter_dates(d_from, d_to):
-        api = await fetch_trains(dep_code, arv_code, d)
-        full_text += format_trains(d, api, dep_name, arv_name)
+        lang = context.user_data.get("lang") or await get_user_lang(DB_PATH, update.effective_chat.id)
+        api = await fetch_trains(dep_code, arv_code, d, lang=lang)
+        full_text += format_trains(d, api, dep_name, arv_name, lang)
         snapshot[d] = api
+    
+    # 1️⃣ asosiy matn + 🎫 bilet tugmasi
+    await update.effective_message.reply_text(
+        full_text[:3900],
+        reply_markup=buy_ticket_kb(lang)
+    )
 
-    await update.effective_message.reply_text(full_text[:3900], reply_markup=WATCH_KB)
-    await update.effective_message.reply_text("🔄 Kuzatishda davom etaman.")
+    # # 2️⃣ alohida xabar bilan /now /stop
+    # await update.effective_message.reply_text(
+    #     reply_markup=kb_watch(lang)
+    # )
+    await update.effective_message.reply_text(t(lang, "continue_observe"))
 
     # snapshot yangilab qo'yamiz (keyingi kuzatuv uchun)
     await save_watch(DB_PATH, chat_id, {
@@ -1164,14 +1679,14 @@ async def scheduled_job(context: ContextTypes.DEFAULT_TYPE):
     if chat_id:
         await check_and_notify(app, chat_id)
 
-async def route_button_router(update, context):
+async def route_button_router(update, context, lang: str):
     text = (update.message.text or "").strip()
 
     if text == "📍 Yo'nalishni kiritish":
         await start_route(update, context)
         return
 
-    if text == "🔙 Orqaga":
+    if text == t(lang, "back"):
         return
 
     # agar hozircha boshqa matn bo'lsa, e'tibor bermaymiz
@@ -1191,27 +1706,62 @@ async def activity_middleware(update: Update, context: ContextTypes.DEFAULT_TYPE
         last_name=(u.last_name if u else None),
     )
 
+async def contact_handler(update, context):
+    await update.effective_message.reply_text(
+        "📞 Aloqa:\n"
+        "Admin: @ZimZim_Manager\n"
+        "Taklif/ Muammo bo‘lsa shu yerga yozing."
+    )
+
+LANG_PREFIX = "LANG"
+
+def lang_kb():
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🇺🇿 O‘zbekcha", callback_data=f"{LANG_PREFIX}|uz")],
+            [InlineKeyboardButton("🇷🇺 Русский", callback_data=f"{LANG_PREFIX}|ru")],
+            [InlineKeyboardButton("🇺🇸 English", callback_data=f"{LANG_PREFIX}|en")],
+        ]
+    )
+async def lang_handler(update, context):
+    lang = await get_lang(update, context)
+    await update.effective_message.reply_text(t(lang, "lang_choose"), reply_markup=lang_kb())
+
+async def feedback_handler(update, context):
+    lang = await get_lang(update, context)
+    context.user_data["step"] = "feedback"
+    await update.effective_message.reply_text(
+        t(lang, "feedback_ask"),
+        reply_markup=kb_back(lang)
+    )
+
 
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN .env ichida yo'q yoki bo'sh")
     
-    # DB init
+    # ✅ Python 3.12: asosiy thread uchun event loop yaratib qo'yamiz
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+
+    # ✅ DB init shu loopda
     loop.run_until_complete(init_db(DB_PATH))
 
-    app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .build()
-    )
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    # 🔹 TIL TANLASH CALLBACK HANDLER
+    app.add_handler(CallbackQueryHandler(lang_callback, pattern=f"^{LANG_PREFIX}\\|"), group=1)
+
+    import traceback
 
     async def error_handler(update, context):
         try:
             print(f"[ERROR] {type(context.error).__name__}: {context.error}")
+            traceback.print_exception(type(context.error), context.error, context.error.__traceback__)
         except Exception:
             pass
+    
+    app.add_error_handler(error_handler)
 
     # 0-group: middleware (hamma update)
     app.add_handler(MessageHandler(filters.ALL, activity_middleware), group=0)
@@ -1219,8 +1769,9 @@ def main():
     # 1-group: asosiy handlerlar (start ishlashi uchun)
     app.add_handler(CommandHandler("start", start), group=1)
     app.add_handler(MessageHandler(filters.CONTACT, phone_contact_handler), group=1)
-    app.add_handler(MessageHandler(filters.Regex(r"^📍 Yo'nalishni kiritish$"), start_route), group=1)
-    app.add_handler(MessageHandler(filters.Regex(r"^🔙 Orqaga$"), back_to_main), group=1)
+    
+    # ✅ 3 tildagi menu tugmalarini ushlaydigan router
+    app.add_handler(MessageHandler(filters.Regex(MENU_PATTERN), menu_router), group=1)
 
     # app.add_handler(CommandHandler("watch", watch), group=1)
     app.add_handler(CommandHandler("stop", stop), group=1)
@@ -1248,45 +1799,111 @@ async def inline_button_handler(update, context):
     if query.data == "empty":
         await query.edit_message_text("Hozircha bu tugma bo‘sh 🙂")
 
+_STATION_PICK_RE = re.compile(r"^\s*(.*?)\s*\((\d+)\)\s*$")
+
+def _parse_station_pick(text):
+    return text.strip(), None
+
 async def flow_handler(update, context):
-    # # Registratsiya tugamaguncha hamma narsa blok
-    # if _need_phone(context):
-    #     await update.effective_message.reply_text(
-    #         "📱 Iltimos, telefon raqamingizni yuboring (pastdagi tugma orqali) 👇",
-    #         reply_markup=PHONE_KB
-    #     )
-    #     return
+    lang = await get_lang(update, context)
+    # ⭐️ feedback rejimi
+    if context.user_data.get("step") == "feedback":
+        text = (update.effective_message.text or "").strip()
+        # "Orqaga" bosilsa feedback yozmaymiz
+        if text == b(lang, "back"):
+            context.user_data["step"] = None
+            await update.effective_message.reply_text(t(lang, "main_home"), reply_markup=kb_main(lang))
+            return
+
+        # Menu tugmalarini feedback deb qabul qilmaymiz
+        if text in (
+            b(lang, "feedback"),
+            b(lang, "lang"),
+            b(lang, "contact"),
+            b(lang, "route"),
+            "📍 Yo'nalishni kiritish",
+            "🌐 Tilni tanlash",
+            "📞 Aloqa",
+            "⭐ Fikr qoldirish",
+        ):
+            return
+        
+        # bo‘sh xabar bo‘lsa ham qabul qilmaymiz
+        if not text:
+            await update.effective_message.reply_text(t(lang, "feedback_prompt"), reply_markup=kb_main(lang))
+            return
+        
+        context.user_data["step"] = None
+        await add_feedback(DB_PATH, update.effective_chat.id, text)
+        await update.effective_message.reply_text(t(lang, "feedback_ok"), reply_markup=kb_main(lang))
+        return
     step = context.user_data.get("step")
+
+    chat_id = update.effective_chat.id
+    lang = context.user_data.get("lang") or await get_user_lang(DB_PATH, chat_id)
+    context.user_data["lang"] = lang
+
+    text = (update.effective_message.text or "").strip()
+
+    # # 📞 Aloqa
+    # if text == b(lang, "contact"):
+    #     await update.effective_message.reply_text(t(lang, "contact_text"), reply_markup=kb_main(lang))
+    #     return
+
+    # # 🌐 Tilni tanlash
+    # if text == b(lang, "lang"):
+    #     await update.effective_message.reply_text(t(lang, "choose_lang"), reply_markup=LANG_KB)
+    #     return
+
+    # # ⭐️ Fikr qoldirish
+    # if text == b(lang, "feedback"):
+    #     context.user_data["step"] = "feedback"
+    #     await update.effective_message.reply_text(t(lang, "feedback_ask"), reply_markup=ReplyKeyboardRemove())
+    #     return
+
+    
     # Registratsiya tugamaguncha boshqa narsaga o'tkazmaymiz
     if step == "need_phone":
         await update.effective_message.reply_text(
             "📱 Iltimos, telefon raqamingizni tugma orqali yuboring 👇",
-            reply_markup=PHONE_KB
+            reply_markup=kb_phone(lang)
         )
         return
-    text = (update.message.text or "").strip()
 
-    # ✅ "📍 Yo'nalishni kiritish" tugmasini flow_handler bekat deb o‘qimasin
-    if text == "📍 Yo'nalishni kiritish":
+    MENU_TEXTS = {
+        b(lang, "route"),
+        b(lang, "lang"),
+        b(lang, "contact"),
+        b(lang, "feedback"),
+    }
+
+    # ✅ Menu bosilsa — flow_handler umuman aralashmasin
+    if text in MENU_TEXTS:
+        return
+    
+    step = context.user_data.get("step")
+
+    # ✅ step yo‘q bo‘lsa, bu oddiy menu/bo‘sh holat — bekat qidirishga kirmaymiz
+    if step is None:
         return
 
     # Orqaga
-    if text == "🔙 Orqaga":
+    if text == t(lang, "back"):
         return
 
     # pagination
-    if text in ("⬅️ Oldingi", "➡️ Keyingi"):
+    if text in (t(lang, "previous"), t(lang, "next")):
         items = context.user_data.get("station_items") or []
         page = int(context.user_data.get("station_page") or 0)
-        if text == "⬅️ Oldingi":
+        if text == t(lang, "previous"):
             page = max(0, page - 1)
         else:
             page = page + 1
 
         context.user_data["station_page"] = page
         await update.effective_message.reply_text(
-            "Topilgan bekatlardan birini tanlang:",
-            reply_markup=_stations_keyboard(items, page=page)
+            t(lang, "choose_station"),
+            reply_markup=_stations_keyboard(lang, items, page=page)
         )
         return
 
@@ -1294,11 +1911,18 @@ async def flow_handler(update, context):
     if step == "dep_query":
         q = text
         if len(q) < 3:
-            await update.effective_message.reply_text("❗ Kamida 3 ta harf yozing. Masalan: Toshkent")
+            await update.effective_message.reply_text(f"❗ Kamida 3 {t(lang, "item")} harf yozing. Masalan: Toshkent")
             return
-        await update.effective_message.reply_text("🔎 Qidiryapman...")
+        await update.effective_message.reply_text(t(lang, "searching"))
         try:
-            items = await search_stations(q)
+            lang = context.user_data.get("lang") or await get_user_lang(DB_PATH, update.effective_chat.id)
+            try:
+                items = await search_stations(q, lang=lang)
+            except RuntimeError as e:
+                if "stations_tech_break" in str(e):
+                    await update.effective_message.reply_text("⏳ Hozir texnik tanaffus. Birozdan keyin urinib ko‘ring.")
+                    return
+                raise
         except RuntimeError as e:
             msg = str(e)
             # 424 texnik tanaffus bo'lsa userga tushunarli yozamiz
@@ -1316,7 +1940,7 @@ async def flow_handler(update, context):
             return
 
         if not items:
-            await update.effective_message.reply_text("❌ Bekat topilmadi. Yana yozib ko‘ring.")
+            await update.effective_message.reply_text(t(lang, "try_writing"))
             return
 
         context.user_data["station_items"] = items
@@ -1324,29 +1948,50 @@ async def flow_handler(update, context):
         context.user_data["step"] = "dep_pick"
 
         await update.effective_message.reply_text(
-            "Topilgan bekatlardan birini tanlang:",
-            reply_markup=_stations_keyboard(items, page=0)
+            t(lang, "choose_station"),
+            reply_markup=_stations_keyboard(lang, items, page=0)
         )
         return
 
     # 2) Ketish bekati: foydalanuvchi keyboard’dan tanlaydi
     if step == "dep_pick":
         items = context.user_data.get("station_items") or []
-        selected = next((s for s in items if s["name"] == text), None)
+        name, code = _parse_station_pick(text)
+        # ✅ pagination tugmalari bo‘lsa (agar siz ishlatayotgan bo‘lsangiz)
+        if name == b(lang, "previous") or name == b(lang, "next"):
+            page = int(context.user_data.get("station_page") or 0)
+            if name == b(lang, "previous"):
+                page = max(0, page - 1)
+            else:
+                page = page + 1
+
+            context.user_data["station_page"] = page
+            await update.effective_message.reply_text(
+                t(lang, "choose_station"),
+                reply_markup=_stations_keyboard(lang, items, page=page)
+            )
+            return
+         # ✅ tanlovni kod bo‘yicha (eng ishonchli), bo‘lmasa nom bo‘yicha topamiz
+        selected = None
+
+        if code:
+            selected = next((s for s in items if str(s.get("code")) == str(code)), None)
+        if not selected:
+            selected = next((s for s in items if (s.get("name") or "").strip() == name), None)
 
         if not selected:
-            await update.effective_message.reply_text("Iltimos, ro‘yxatdan tanlang (tugmani bosing).")
+            await update.effective_message.reply_text(t(lang, "select_list"))
             return
 
         context.user_data["dep_name"] = selected["name"]
         context.user_data["dep_code"] = selected["code"]
 
+        # keyingi bosqichingiz qanday bo‘lsa o‘sha qoladi
         context.user_data["step"] = "arv_query"
-        context.user_data.pop("station_items", None)
-        context.user_data.pop("station_page", None)
-
+        # context.user_data.pop("station_items", None)
+        # context.user_data.pop("station_page", None)
         await update.effective_message.reply_text(
-            "Qayerga borasiz? (Bekatni yozing. Misol uchun: Termiz)",
+            t(lang, "go_to"),
             reply_markup=ReplyKeyboardRemove()
         )
         return
@@ -1355,11 +2000,18 @@ async def flow_handler(update, context):
     if step == "arv_query":
         q = text
         if len(q) < 3:
-            await update.effective_message.reply_text("❗ Kamida 3 ta harf yozing. Masalan: Toshkent")
+            await update.effective_message.reply_text(f"❗ Kamida 3 {t(lang, "item")} harf yozing. Masalan: Toshkent")
             return
-        await update.effective_message.reply_text("🔎 Qidiryapman...")
+        await update.effective_message.reply_text(t(lang, "searching"))
         try:
-            items = await search_stations(q)
+            lang = context.user_data.get("lang") or await get_user_lang(DB_PATH, update.effective_chat.id)
+            try:
+                items = await search_stations(q, lang=lang)
+            except RuntimeError as e:
+                if "stations_tech_break" in str(e):
+                    await update.effective_message.reply_text("⏳ Hozir texnik tanaffus. Birozdan keyin urinib ko‘ring.")
+                    return
+                raise
         except RuntimeError as e:
             msg = str(e)
             # 424 texnik tanaffus bo'lsa userga tushunarli yozamiz
@@ -1377,7 +2029,7 @@ async def flow_handler(update, context):
             return
 
         if not items:
-            await update.effective_message.reply_text("❌ Bekat topilmadi. Yana yozib ko‘ring.")
+            await update.effective_message.reply_text(t(lang, "try_writing"))
             return
 
         context.user_data["station_items"] = items
@@ -1385,32 +2037,44 @@ async def flow_handler(update, context):
         context.user_data["step"] = "arv_pick"
 
         await update.effective_message.reply_text(
-            "Topilgan bekatlardan birini tanlang:",
-            reply_markup=_stations_keyboard(items, page=0)
+            t(lang, "choose_station"),
+            reply_markup=_stations_keyboard(lang, items, page=0)
         )
         return
 
-    # 4) Borish bekati: tanlash
     if step == "arv_pick":
         items = context.user_data.get("station_items") or []
-        selected = next((s for s in items if s["name"] == text), None)
+        name, code = _parse_station_pick(text)
 
-        if not selected:
-            await update.effective_message.reply_text("Iltimos, ro‘yxatdan tanlang (tugmani bosing).")
+        if name == b(lang, "previous") or name == b(lang, "next"):
+            page = int(context.user_data.get("station_page") or 0)
+            if name == b(lang, "previous"):
+                page = max(0, page - 1)
+            else:
+                page = page + 1
+
+            context.user_data["station_page"] = page
+            await update.effective_message.reply_text(
+                t(lang, "choose_station"),
+                reply_markup=_stations_keyboard(lang, items, page=page)
+            )
             return
 
-        dep_code = context.user_data.get("dep_code")
-        if selected["code"] == dep_code:
-            await update.effective_message.reply_text("❌ Borish bekati ketish bekati bilan bir xil bo‘lmasin.")
+        selected = None
+        if code:
+            selected = next((s for s in items if str(s.get("code")) == str(code)), None)
+        if not selected:
+            selected = next((s for s in items if (s.get("name") or "").strip() == name), None)
+
+        if not selected:
+            await update.effective_message.reply_text(t(lang, "pick_from_list"))
             return
 
         context.user_data["arv_name"] = selected["name"]
         context.user_data["arv_code"] = selected["code"]
 
+        # keyingi bosqichingiz (kalendar chiqarish) qanday bo‘lsa o‘sha qoladi
         context.user_data["step"] = "choose_date_from"
-        context.user_data.pop("station_items", None)
-        context.user_data.pop("station_page", None)
-
         await send_calendar(update, context, "from")
         return
 
@@ -1459,7 +2123,7 @@ def seats_breakdown(car_type: str, seat_detail: dict, free: int):
 
     return None
 
-def format_trains(d, api, dep_name, arv_name):
+def format_trains(d, api, dep_name, arv_name, lang: str):
     text = f"\n📅 {fmt_date_obj(d) if hasattr(d,'day') else fmt_date(d)}\n"
 
     trains = (
@@ -1470,16 +2134,16 @@ def format_trains(d, api, dep_name, arv_name):
     )
 
     if not trains:
-        return text + "❌ Bu kunda poyezd topilmadi.\n"
+        return text + f"{t(lang, "no_trains")}\n"
 
     j = 0
 
-    for i, t in enumerate(trains, start=1):
-        num = t.get("number")
+    for i, trn in enumerate(trains, start=1):
+        num = trn.get("number")
 
         total_places = sum(
             int(car.get("freeSeats") or 0)
-            for car in t.get("cars", [])
+            for car in trn.get("cars", [])
         )
         # ✅ Joyi yo‘q poyezdni umuman chiqarma
         if total_places <= 0:
@@ -1487,31 +2151,31 @@ def format_trains(d, api, dep_name, arv_name):
             continue
 
         # 1) Poyezdning asl yo‘nalishi (butun marshrut)
-        full_from = t.get("originRoute", {}).get("depStationName") or ""
-        full_to = t.get("originRoute", {}).get("arvStationName") or ""
+        full_from = trn.get("originRoute", {}).get("depStationName") or ""
+        full_to = trn.get("originRoute", {}).get("arvStationName") or ""
 
         # 2) Siz tanlagan segment (subRoute)
-        seg_from = t.get("subRoute", {}).get("depStationName") or dep_name
-        seg_to = t.get("subRoute", {}).get("arvStationName") or arv_name
+        seg_from = trn.get("subRoute", {}).get("depStationName") or dep_name
+        seg_to = trn.get("subRoute", {}).get("arvStationName") or arv_name
 
-        dep_time = t.get("departureDate")  # masalan: "21.01.2026 21:13"
-        arv_time = t.get("arrivalDate")
-        way = t.get("timeOnWay")
+        dep_time = trn.get("departureDate")  # masalan: "21.01.2026 21:13"
+        arv_time = trn.get("arrivalDate")
+        way = trn.get("timeOnWay")
 
         total_places = sum(
             int(car.get("freeSeats") or 0)
-            for car in t.get("cars", [])
+            for car in trn.get("cars", [])
         )
 
         text += (
             f"🚆 #{i}:  {num}  {full_from} → {full_to}\n"
             f"🕒 {seg_from.upper()} / ({dep_time})\n"
             f"🕒 {seg_to.upper()} / ({arv_time})\n"
-            f"⏱️ Yo‘l davomiyligi: {way}\n"
-            f"📋 Bo‘sh o‘rinlar : {total_places} ta joy\n"
+            f"{t(lang, "traver_duration")} {way}\n"
+            f"{t(lang, "available_place")} {total_places} {t(lang, "item")} {t(lang, "place")}\n"
         )
 
-        for c in t.get("cars", []):
+        for c in trn.get("cars", []):
             ctype = c.get("type")
             free = c.get("freeSeats")
 
@@ -1533,20 +2197,20 @@ def format_trains(d, api, dep_name, arv_name):
 
                 # SV bo‘lsa tepa/pastki ko‘rsatmaymiz
                 if ct_low in ("sv", "св") or "sv" in ct_low or "св" in ct_low:
-                    text += f"• {ctype} : {free} ta joy → {price_txt} so‘m\n"
+                    text += f"• {ctype} : {free} {t(lang, "item")} {t(lang, "place")} → {price_txt} {t(lang, "currency")}\n"
                 else:
                     text += (
-                        f"• {ctype} : {free} ta joy "
-                        f"(Tepa {tepa} ta, Pastki {pastki} ta) "
-                        f"→ {price_txt} so‘m\n"
+                        f"• {ctype} : {free} {t(lang, "item")} {t(lang, "place")} "
+                        f"({t(lang, "high")} {tepa} {t(lang, "item")}, {t(lang, "lower")} {pastki} {t(lang, "item")}) "
+                        f"→ {price_txt} {t(lang, "currency")}\n"
                     )
             else:
-                text += f"• {ctype} : {free} ta joy → {price_txt} so‘m\n"
+                text += f"• {ctype} : {free} {t(lang, "item")} {t(lang, "place")} → {price_txt} {t(lang, "currency")}\n"
 
         text += "\n"
 
     if j == i:
-        text += "❌ Bu kunda bo‘sh joy topilmadi.\n"
+        text += f"{t(lang, "no_available")}\n"
 
     return text
 
@@ -1567,22 +2231,25 @@ async def search_in_range_and_show(update, context):
     d_from = context.user_data["date_from"]
     d_to = context.user_data["date_to"]
 
-    await update.effective_message.reply_text("🔍 Qidiruv boshlandi...")
+    lang = context.user_data.get("lang") or await get_user_lang(DB_PATH, update.effective_chat.id)
+
+    await update.effective_message.reply_text(t(lang, "search_start"))
     dep_name = context.user_data.get("dep_name") or context.user_data.get("dep") or "—"
     arv_name = context.user_data.get("arv_name") or context.user_data.get("arv") or "—"
-    full_text = "🎟 Mavjud chiptalar:\n"
+    full_text = f"{t(lang, "available_tickets")}\n"
     full_text += f"📍 {dep_name} → {arv_name}\n"
     snapshot = {}
 
     for d in iter_dates(d_from, d_to):
-        api = await fetch_trains(dep_code, arv_code, d)
+        lang = context.user_data.get("lang") or await get_user_lang(DB_PATH, update.effective_chat.id)
+        api = await fetch_trains(dep_code, arv_code, d, lang=lang)
         dep_name = context.user_data.get("dep_name") or context.user_data.get("dep") or str(dep_code)
         arv_name = context.user_data.get("arv_name") or context.user_data.get("arv") or str(arv_code)
-        full_text += format_trains(d, api, dep_name, arv_name)
+        full_text += format_trains(d, api, dep_name, arv_name, lang)
         snapshot[d] = api
 
     # ✅ faqat 1 marta yuboramiz
-    await update.effective_message.reply_text(full_text)
+    await send_long_text(update, full_text, reply_markup=buy_ticket_kb(lang))
 
     # ✅ DB'ga watch konfiguratsiya + snapshot saqlaymiz
     chat_id = update.effective_chat.id
@@ -1602,10 +2269,8 @@ async def search_in_range_and_show(update, context):
     })
 
     await update.effective_message.reply_text(
-        "🔔 Kuzatish boshlandi.\n"
-        "Agar joylar kamayib yoki ko‘payib ketsa,\n"
-        "yoki yangi vagon chiqsa — darhol habar beraman.",
-        reply_markup=WATCH_KB
+        t(lang, "monitoring"),
+        reply_markup=kb_watch(lang)
     )
 
 
@@ -1636,6 +2301,12 @@ async def watcher_job(context: ContextTypes.DEFAULT_TYPE):
     for w in watches:
         chat_id = int(w["chat_id"])
 
+        lang = (
+            context.application.chat_data.get(chat_id, {}).get("lang")
+            or await get_user_lang(DB_PATH, chat_id)
+            or "uz"
+        )
+
         dep_code = w.get("dep_code")
         arv_code = w.get("arv_code")
         d_from = w.get("date_from")
@@ -1661,7 +2332,7 @@ async def watcher_job(context: ContextTypes.DEFAULT_TYPE):
         for d in iter_dates(d_from, d_to):
             try:
                 async with WATCH_SEM:
-                    api = await fetch_trains(dep_code, arv_code, d)
+                    api = await fetch_trains(dep_code, arv_code, d, lang=lang)
             except Exception as e:
                 print(f"[watcher_job] fetch_trains error chat_id={chat_id}: {e}")
                 continue
@@ -1677,17 +2348,27 @@ async def watcher_job(context: ContextTypes.DEFAULT_TYPE):
             continue  # umuman o'zgarish yo'q
 
         if changed_days:
-            text = "🚨 O‘zgarish aniqlandi!\n"
+            text = f"{t(lang, "change_detected")}\n"
             text += f"📍 {dep_name} → {arv_name}\n"
 
             for d in changed_days[:3]:  # spam bo'lmasin (xohlasang olib tashlaymiz)
-                text += f"\n\n📅 {fmt_date(d)}\n"
                 old_api = old_snapshot.get(d, {})
                 new_api = new_snapshot.get(d, {})
-                text += _watch_day_report(old_api, new_api)
 
-            text += "\n\n🔄 Kuzatishda davom etaman."
-            await context.application.bot.send_message(chat_id=chat_id, text=text[:3900])
+                day_report = _watch_day_report(old_api, new_api, lang)
+                if not day_report or not day_report.strip():
+                    continue  # ✅ bo‘sh bo‘lsa bu sanani umuman chiqarmaymiz
+
+                text += f"\n\n📅 {fmt_date(d)}\n"
+                text += day_report
+
+            text += f"\n\n {t(lang, "continue_observe")}"
+            for i in range(0, len(text), 3900):
+                await context.application.bot.send_message(
+                    chat_id=chat_id,
+                    text=text[:3900],
+                    reply_markup=buy_ticket_kb(lang),
+                )
 
         # snapshotni DBga yangilab qo'yamiz
         await save_watch(DB_PATH, chat_id, {
