@@ -26,7 +26,7 @@ load_dotenv()
 
 WATCH_SEM = asyncio.Semaphore(3)  # bir vaqtda 3 ta so'rov (ko'paytirsang ham bo'ladi)
 WATCH_CHAT_ID = os.getenv("WATCH_CHAT_ID", "").strip()
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
 DB_PATH = os.getenv("DB_PATH", "bot.db").strip()
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "120"))
 MAX_TG = 3900  # 4096 dan biroz past (xavfsiz)
@@ -218,7 +218,7 @@ TEXT = {
         "ru": "🗓 Выберите дату окончания:",
         "en": "🗓 Select end date:",
     },
-    "xato2": {
+    "start_data_earlier": {
         "uz": "❌ Boshlanish sana bugundan oldin bo‘lishi mumkin emas.",
         "ru": "❌ Дата начала не может быть раньше сегодняшнего дня.",
         "en": "❌ The start date cannot be earlier than today.",
@@ -404,30 +404,40 @@ TEXT = {
         "ru": "🚨 Обнаружены изменения!",
         "en": "🚨 Change detected!",
     },
-    "qwerty": {
-        "uz": "❌ Bekat topilmadi. Yana yozib ko‘ring.",
-        "ru": "❌ Остановка не найдена. Попробуйте написать ещё раз.",
-        "en": "❌ Stop not found. Try writing again.",
+    "track_disabled": {
+        "uz": "⛔ Kuzatish yoqilmagan.\n""📍 Yo'nalishni kiriting.",
+        "ru": "⛔ Наблюдение выключено..\n""📍 Укажите направление.",
+        "en": "⛔ Tracking is disabled.\n""📍 Enter the destination.",
     },
-    "qwerty": {
-        "uz": "❌ Bekat topilmadi. Yana yozib ko‘ring.",
-        "ru": "❌ Остановка не найдена. Попробуйте написать ещё раз.",
-        "en": "❌ Stop not found. Try writing again.",
+    "contact_all": {
+        "uz": "📞 Aloqa va qo‘llab-quvvatlash \n\n""🚆 O‘zbekiston Temir Yo‘llari (Uzrailways) \n""🌐 Rasmiy sayt: https://eticket.railway.uz \n""📱 Mobil ilova: Uzrailway tickets \n""☎️ Call-center: 1005 \n\n""👨‍💻 Bot bo‘yicha savollar / takliflar: \n""Admin: @mb_coderpy",
+        "ru": "📞 Контакты и поддержка \n\n""🚆 Узбекистон Темир Йуллари (Uzrailways) \n""🌐 Официальный сайт: https://eticket.railway.uz \n""📱 Мобильное приложение: Uzrailway tickets \n""📞 Колл-центр: 1005 \n\n""👨‍💻 Вопросы / предложения по боту: \n""Администратор: @mb_coderpy",
+        "en": "📞 Contacts & Support \n\n""🚆 Uzbekistan Railways (Uzrailways) \n""🌐 Official website: https://eticket.railway.uz \n""📱 Mobile app: Uzrailway tickets \n""📞 Call center: 1005 \n\n""👨‍💻 Bot questions / suggestions: \n""Admin: @mb_coderpy",
     },
-    "qwerty": {
-        "uz": "❌ Bekat topilmadi. Yana yozib ko‘ring.",
-        "ru": "❌ Остановка не найдена. Попробуйте написать ещё раз.",
-        "en": "❌ Stop not found. Try writing again.",
+    "letter3": {
+        "uz": "❗ Kamida 3 ta harf yozing. Masalan: Toshkent",
+        "ru": "❗ Введите не менее 3 букв. Пример: Ташкент",
+        "en": "❗ Write at least 3 letters. For example: Tashkent",
     },
-    "qwerty": {
-        "uz": "❌ Bekat topilmadi. Yana yozib ko‘ring.",
-        "ru": "❌ Остановка не найдена. Попробуйте написать ещё раз.",
-        "en": "❌ Stop not found. Try writing again.",
+    "pause_try_again": {
+        "uz": "⏳ Hozir texnik tanaffus. Birozdan keyin urinib ko‘ring.",
+        "ru": "⏳ Сейчас технический перерыв. Попробуйте через некоторое время.",
+        "en": "⏳ We are currently experiencing a technical pause. Please try again shortly.",
     },
-    "qwerty": {
-        "uz": "❌ Bekat topilmadi. Yana yozib ko‘ring.",
-        "ru": "❌ Остановка не найдена. Попробуйте написать ещё раз.",
-        "en": "❌ Stop not found. Try writing again.",
+    "system_undergoing": {
+        "uz": "🛠 Hozir tizimda texnik tanaffus bor.\n""Birozdan keyin qayta urinib ko‘ring (odatda 20-30 daqiqa).\n""Agar xohlasangiz, boshqa bekat nomi bilan ham urinib ko‘ring.",
+        "ru": "🛠 В данный момент в системе технический перерыв.\n""Попробуйте снова через некоторое время (обычно через 20-30 минут).\n""Если хотите, попробуйте с другим названием остановки.",
+        "en": "🛠 The system is currently undergoing maintenance.\n""Try again in a little while (usually after 20-30 minutes).\n""If you'd like, try using a different stop name.",
+    },
+    "error_station": {
+        "uz": "❌ Bekat qidirishda xatolik. Birozdan keyin qayta urinib ko‘ring.",
+        "ru": "🚨 Ошибка при поиске остановки. Повторите попытку через некоторое время.",
+        "en": "🚨 Error in station search. Please try again in a moment.",
+    },
+    "no_selected_stop": {
+        "uz": "❌ Bekat tanlanmagan. Qaytadan 📍 Yo'nalishni kiritish qiling.",
+        "ru": "❌ Остановка не выбрана. Пожалуйста, заново 📍 укажите направление.",
+        "en": "❌ No stop has been selected. Please enter the 📍 Direction again.",
     },
 }
 
@@ -706,13 +716,23 @@ def _watch_day_report(old_api: dict, new_api: dict, lang: str) -> str:
     out = []
     idx = 0
 
-    for num in sorted(new_map.keys()):
-        meta = (new_map[num].get("meta") or {})
+    all_nums = sorted(set(old_map.keys()) | set(new_map.keys()))
+    for num in all_nums:
+        meta = ((new_map.get(num) or {}).get("meta") or (old_map.get(num) or {}).get("meta") or {})
         full_from = meta.get("from", "")
         full_to = meta.get("to", "")
 
         old_cars = (old_map.get(num) or {}).get("cars", {})
         new_cars = (new_map.get(num) or {}).get("cars", {})
+
+        # ✅ agar poyezd oldin bor edi, hozir umuman yo‘q — "yo'qoldi" deb chiqaramiz
+        if num in old_map and num not in new_map:
+            idx += 1
+            out.append(f"🚆 #{idx}:  {num}  {meta.get('from','')} → {meta.get('to','')}")
+            out.append(f"{t(lang, 'available_place')} 0 {t(lang, 'item')} {t(lang, 'place')} (➖{sum(int(v.get('free') or 0) for v in (old_cars or {}).values())})")
+            out.append("")  # bo'sh qator
+            continue
+
 
         # ✅ faqat 0dan katta joylarni hisoblaymiz
         total_now = sum(int(v.get("free") or 0) for v in new_cars.values() if int(v.get("free") or 0) > 0)
@@ -725,15 +745,20 @@ def _watch_day_report(old_api: dict, new_api: dict, lang: str) -> str:
         out.append(f"🚆 #{idx}:  {num}  {full_from} → {full_to}")
         out.append(f"{t(lang, "available_place")} {total_now} {t(lang, "item")} {t(lang, "place")}")
 
-        for ctype in sorted(new_cars.keys()):
+        all_types = sorted(set(old_cars.keys()) | set(new_cars.keys()))
+        for ctype in all_types:
             now = new_cars.get(ctype) or {}
-            now_free = int(now.get("free") or 0)
-            if now_free <= 0:
-                continue  # ✅ 0 bo‘lgan vagon turini ham chiqarma
-
             was = old_cars.get(ctype) or {}
-            was_free = int(was.get("free") or 0)
+            now_free = int((now or {}).get("free") or 0)
+            was_free = int((was or {}).get("free") or 0)
             delta = now_free - was_free
+
+            # ✅ ikkalasi ham 0 bo'lsa kerak emas
+            if now_free <= 0 and was_free <= 0:
+                continue
+
+            # ✅ agar hozir 0 bo'lib qolgan bo'lsa (sotilgan) — ham chiqaramiz
+            sold_out = (now_free <= 0 and was_free > 0)
 
             # tepa/past
             now_up = int(now.get("up") or 0)
@@ -750,12 +775,18 @@ def _watch_day_report(old_api: dict, new_api: dict, lang: str) -> str:
                 sign = f"(➕{delta})" if delta > 0 else f"(➖{abs(delta)})"
 
             if is_sv or is_umumiy:
+                if sold_out:
+                    out.append(f"• {ctype} {sign} : 0 {t(lang, 'item')} {t(lang, 'place')}")
+                    continue
                 # SV: faqat son
                 if delta == 0:
                     out.append(f"• {ctype} : {now_free} {t(lang, "item")} {t(lang, "place")}")
                 else:
                     out.append(f"• {ctype} {sign} : {now_free} {t(lang, "item")} {t(lang, "place")}")
             else:
+                if sold_out:
+                    out.append(f"• {ctype} {sign} : 0 {t(lang, 'item')} {t(lang, 'place')}")
+                    continue
                 # boshqalar: tepa/past FAQAT mavjud bo'lsa ko'rsatamiz
                 show_ud = (now_up + now_down) > 0
 
@@ -938,7 +969,6 @@ async def check_and_notify(app: Application, chat_id: int, lang: str):
         await app.bot.send_message(chat_id=chat_id, text=msg[:3500])
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    lang = await get_lang(update, context)
     chat_id = update.effective_chat.id
     u = update.effective_user
 
@@ -954,11 +984,30 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await upsert_user(DB_PATH, chat_id, u.id if u else None, u.username if u else None,
                       u.first_name if u else None, u.last_name if u else None)
 
-    lang = await get_user_lang(DB_PATH, chat_id)
+    # ✅ 1) Avval til tekshiramiz
+    db_lang = await get_user_lang(DB_PATH, chat_id)  # sendagi funksiya
+    if not db_lang:
+        context.user_data["step"] = "choose_lang"
+        await update.effective_message.reply_text(
+            "🌐 Iltimos, tilni tanlang / Please choose language / Пожалуйста, выберите язык",
+            reply_markup=LANG_KB
+        )
+        return
+
+    lang = db_lang
     context.user_data["lang"] = lang
 
-    first = (u.first_name or t(lang, "comrade")).strip() if u else t(lang, "comrade")
 
+    # ✅ ro'yxatdan o'tmagan bo'lsa /startdayoq telefon so'raymiz
+    if await need_phone(context, chat_id):
+        context.user_data["step"] = "need_phone"
+        await update.effective_message.reply_text(
+            t(lang, "ask_phone"),
+            reply_markup=kb_phone(lang)
+        )
+        return
+
+    first = (u.first_name or t(lang, "comrade")).strip() if u else t(lang, "comrade")
     await update.effective_message.reply_text(
         t(lang, "start_hi", first=first),
         reply_markup=kb_main(lang)
@@ -1046,23 +1095,9 @@ async def phone_contact_handler(update, context):
 
     first = (update.effective_user.first_name or t(lang, "comrade")).strip()
     await update.effective_message.reply_text(
-        t(lang, "start_hi"),
+        t(lang, "start_hi", first=first),
         reply_markup=kb_main(lang)
     )
-
-
-async def watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    lang = await get_lang(update, context)
-    chat_id = update.effective_chat.id
-    await set_watch_enabled(DB_PATH, chat_id, True)
-
-    await update.effective_message.reply_text(
-        f"✅ Kuzatish yoqildi. Har {POLL_SECONDS} soniyada tekshiraman.\n"
-        "📍 Yo‘nalish/sana tanlangan bo‘lsa — avtomatik ishlaydi.\n"
-        "Agar hali tanlanmagan bo‘lsa, qidiruv qiling.",
-        reply_markup=kb_watch(lang)
-    )
-
 
 
 async def start_route(update, context):
@@ -1426,16 +1461,10 @@ async def calendar_handler(update, context):
         context.user_data["step"] = None
 
         await _safe_edit_text(query,t(lang, "cancelled"))
-        # xohlasangiz asosiy menyu tugmalarini qaytarib qo'yamiz:
-        reply_keyboard = [
-            ["📍 Yo'nalishni kiritish"],
-            ["/watch — kuzatishni yoqish"],
-            ["/now — hozir tekshirish"],
-            ["/stop — kuzatishni o‘chirish"]
-        ]
+
         await query.message.reply_text(
             t(lang, "main_home"),
-            reply_markup=ReplyKeyboardMarkup(reply_keyboard, resize_keyboard=True)
+            reply_markup=kb_main(lang)
         )
         return
 
@@ -1452,7 +1481,7 @@ async def calendar_handler(update, context):
             if selected_date < today:
                 # eski kalendarni yopamiz
                 try:
-                    await _safe_edit_text(query, t(lang, "start_data"))
+                    await _safe_edit_text(query, t(lang, "start_data_earlier"))
                 except Exception:
                     pass
 
@@ -1617,8 +1646,7 @@ async def now(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if (not w) or (not w.get("enabled")):
         await update.effective_message.reply_text(
-            "⛔ Kuzatish yoqilmagan.\n"
-            "📍 Yo'nalishni kiriting."
+            t(lang, "track_disabled")
         )
         return
 
@@ -1682,7 +1710,7 @@ async def scheduled_job(context: ContextTypes.DEFAULT_TYPE):
 async def route_button_router(update, context, lang: str):
     text = (update.message.text or "").strip()
 
-    if text == "📍 Yo'nalishni kiritish":
+    if text == b(lang, "route"):
         await start_route(update, context)
         return
 
@@ -1707,10 +1735,10 @@ async def activity_middleware(update: Update, context: ContextTypes.DEFAULT_TYPE
     )
 
 async def contact_handler(update, context):
+    chat_id = update.effective_chat.id
+    lang = context.user_data.get("lang") or await get_user_lang(DB_PATH, chat_id)
     await update.effective_message.reply_text(
-        "📞 Aloqa:\n"
-        "Admin: @ZimZim_Manager\n"
-        "Taklif/ Muammo bo‘lsa shu yerga yozing."
+        t(lang, "contact_all")
     )
 
 LANG_PREFIX = "LANG"
@@ -1865,7 +1893,7 @@ async def flow_handler(update, context):
     # Registratsiya tugamaguncha boshqa narsaga o'tkazmaymiz
     if step == "need_phone":
         await update.effective_message.reply_text(
-            "📱 Iltimos, telefon raqamingizni tugma orqali yuboring 👇",
+            t(lang, "ask_phone"),
             reply_markup=kb_phone(lang)
         )
         return
@@ -1911,7 +1939,7 @@ async def flow_handler(update, context):
     if step == "dep_query":
         q = text
         if len(q) < 3:
-            await update.effective_message.reply_text(f"❗ Kamida 3 {t(lang, "item")} harf yozing. Masalan: Toshkent")
+            await update.effective_message.reply_text(t(lang, "letter3"))
             return
         await update.effective_message.reply_text(t(lang, "searching"))
         try:
@@ -1920,23 +1948,19 @@ async def flow_handler(update, context):
                 items = await search_stations(q, lang=lang)
             except RuntimeError as e:
                 if "stations_tech_break" in str(e):
-                    await update.effective_message.reply_text("⏳ Hozir texnik tanaffus. Birozdan keyin urinib ko‘ring.")
+                    await update.effective_message.reply_text(t(lang, "pause_try_again"))
                     return
                 raise
         except RuntimeError as e:
             msg = str(e)
             # 424 texnik tanaffus bo'lsa userga tushunarli yozamiz
             if "API status=424" in msg or "stations API status=424" in msg:
-                await update.effective_message.reply_text(
-                    "🛠 Hozir tizimda texnik tanaffus bor.\n"
-                    "Birozdan keyin qayta urinib ko‘ring (odatda 20-30 daqiqa).\n"
-                    "Agar xohlasangiz, boshqa bekat nomi bilan ham urinib ko‘ring."
-                )
+                await update.effective_message.reply_text(t(lang, "system_undergoing"))
                 return
-            await update.effective_message.reply_text("❌ Bekat qidirishda xatolik. Birozdan keyin qayta urinib ko‘ring.")
+            await update.effective_message.reply_text(t(lang, "error_station"))
             return
         except Exception:
-            await update.effective_message.reply_text("❌ Bekat qidirishda xatolik. Birozdan keyin qayta urinib ko‘ring.")
+            await update.effective_message.reply_text(t(lang, "error_station"))
             return
 
         if not items:
@@ -2000,7 +2024,7 @@ async def flow_handler(update, context):
     if step == "arv_query":
         q = text
         if len(q) < 3:
-            await update.effective_message.reply_text(f"❗ Kamida 3 {t(lang, "item")} harf yozing. Masalan: Toshkent")
+            await update.effective_message.reply_text(t(lang, "letter3"))
             return
         await update.effective_message.reply_text(t(lang, "searching"))
         try:
@@ -2009,23 +2033,19 @@ async def flow_handler(update, context):
                 items = await search_stations(q, lang=lang)
             except RuntimeError as e:
                 if "stations_tech_break" in str(e):
-                    await update.effective_message.reply_text("⏳ Hozir texnik tanaffus. Birozdan keyin urinib ko‘ring.")
+                    await update.effective_message.reply_text(t(lang, "pause_try_again"))
                     return
                 raise
         except RuntimeError as e:
             msg = str(e)
             # 424 texnik tanaffus bo'lsa userga tushunarli yozamiz
             if "API status=424" in msg or "stations API status=424" in msg:
-                await update.effective_message.reply_text(
-                    "🛠 Hozir tizimda texnik tanaffus bor.\n"
-                    "Birozdan keyin qayta urinib ko‘ring (odatda 20-30 daqiqa).\n"
-                    "Agar xohlasangiz, boshqa bekat nomi bilan ham urinib ko‘ring."
-                )
+                await update.effective_message.reply_text(t(lang, "system_undergoing"))
                 return
-            await update.effective_message.reply_text("❌ Bekat qidirishda xatolik. Birozdan keyin qayta urinib ko‘ring.")
+            await update.effective_message.reply_text(t(lang, "error_station"))
             return
         except Exception:
-            await update.effective_message.reply_text("❌ Bekat qidirishda xatolik. Birozdan keyin qayta urinib ko‘ring.")
+            await update.effective_message.reply_text(t(lang, "error_station"))
             return
 
         if not items:
@@ -2225,7 +2245,7 @@ async def search_in_range_and_show(update, context):
     arv_code = context.user_data.get("arv_code") or context.user_data.get("arv")
 
     if not dep_code or not arv_code:
-        await update.effective_message.reply_text("❌ Bekat tanlanmagan. Qaytadan 📍 Yo'nalishni kiritish qiling.")
+        await update.effective_message.reply_text(t(lang, "no_selected_stop"))
         return
     
     d_from = context.user_data["date_from"]
@@ -2351,6 +2371,7 @@ async def watcher_job(context: ContextTypes.DEFAULT_TYPE):
             text = f"{t(lang, "change_detected")}\n"
             text += f"📍 {dep_name} → {arv_name}\n"
 
+            has_any = False
             for d in changed_days[:3]:  # spam bo'lmasin (xohlasang olib tashlaymiz)
                 old_api = old_snapshot.get(d, {})
                 new_api = new_snapshot.get(d, {})
@@ -2358,16 +2379,21 @@ async def watcher_job(context: ContextTypes.DEFAULT_TYPE):
                 day_report = _watch_day_report(old_api, new_api, lang)
                 if not day_report or not day_report.strip():
                     continue  # ✅ bo‘sh bo‘lsa bu sanani umuman chiqarmaymiz
-
+                
+                has_any = True
                 text += f"\n\n📅 {fmt_date(d)}\n"
                 text += day_report
 
+            if not has_any:
+                continue
+
             text += f"\n\n {t(lang, "continue_observe")}"
+
             for i in range(0, len(text), 3900):
                 await context.application.bot.send_message(
                     chat_id=chat_id,
-                    text=text[:3900],
-                    reply_markup=buy_ticket_kb(lang),
+                    text=text[i:i+3900],   # ✅ shu yer muhim
+                    reply_markup=buy_ticket_kb(lang) if i == 0 else None,  # ✅ keyboard faqat 1-xabarda
                 )
 
         # snapshotni DBga yangilab qo'yamiz
