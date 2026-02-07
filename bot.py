@@ -1768,14 +1768,10 @@ def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN .env ichida yo'q yoki bo'sh")
     
-    # ✅ Python 3.12: asosiy thread uchun event loop yaratib qo'yamiz
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+    async def post_init(app: Application):
+        await init_db(DB_PATH)
 
-    # ✅ DB init shu loopda
-    loop.run_until_complete(init_db(DB_PATH))
-
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     # 🔹 TIL TANLASH CALLBACK HANDLER
     app.add_handler(CallbackQueryHandler(lang_callback, pattern=f"^{LANG_PREFIX}\\|"), group=1)
@@ -1815,14 +1811,16 @@ def main():
 
 
 
-    # JobQueue PTB ichida ishlaydi (event loop muammosiz)
+    # JobQueue
+    if app.job_queue is None:
+        raise RuntimeError('JobQueue yo‘q. requirements.txt: python-telegram-bot[webhooks,job-queue]==21.10')
     app.job_queue.run_repeating(watcher_job, interval=POLL_SECONDS, first=10)
     
     print("Bot ishga tushdi...")
     USE_WEBHOOK = os.getenv("USE_WEBHOOK", "0") == "1"
     PUBLIC_URL = (os.getenv("PUBLIC_URL") or "").rstrip("/")   # masalan: https://xxx.up.railway.app
     PORT = int(os.getenv("PORT", "8080"))
-    WEBHOOK_PATH = os.getenv("WEBHOOK_PATH") or BOT_TOKEN          # xavfsiz path
+    WEBHOOK_PATH = (os.getenv("WEBHOOK_PATH") or BOT_TOKEN).lstrip("/")
 
     if USE_WEBHOOK:
         if not PUBLIC_URL:
