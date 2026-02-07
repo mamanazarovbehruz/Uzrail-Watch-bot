@@ -141,7 +141,10 @@ async def _fetch_trains_auto(depStationCode, arvStationCode, date_iso, lang: str
     max_tries = int(os.getenv("HTTP_MAX_RETRIES", "3") or "3")
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage"]
+        )
 
         # ENGLISH home ko'proq stabil bo'ladi
         context = await browser.new_context(
@@ -258,7 +261,10 @@ async def _fetch_json_auto(url: str, method: str = "GET", payload: dict | None =
     Return: (status_code, json_or_text, is_json: bool)
     """
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage"]
+        )
         context = await browser.new_context()
         page = await context.new_page()
 
