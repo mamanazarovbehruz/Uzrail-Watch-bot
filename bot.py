@@ -1765,7 +1765,6 @@ async def feedback_handler(update, context):
 
 
 def main():
-    print("BOT_TOKEN exists:", bool(os.getenv("BOT_TOKEN")))
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN .env ichida yo'q yoki bo'sh")
     
