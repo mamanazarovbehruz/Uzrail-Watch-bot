@@ -1819,7 +1819,23 @@ def main():
     app.job_queue.run_repeating(watcher_job, interval=POLL_SECONDS, first=10)
     
     print("Bot ishga tushdi...")
-    app.run_polling()
+    USE_WEBHOOK = os.getenv("USE_WEBHOOK", "0") == "1"
+    PUBLIC_URL = (os.getenv("PUBLIC_URL") or "").rstrip("/")   # masalan: https://xxx.up.railway.app
+    PORT = int(os.getenv("PORT", "8080"))
+    WEBHOOK_PATH = os.getenv("WEBHOOK_PATH") or BOT_TOKEN          # xavfsiz path
+
+    if USE_WEBHOOK:
+        if not PUBLIC_URL:
+            raise RuntimeError("PUBLIC_URL env yo‘q. Railway public domenini PUBLIC_URL ga qo‘ying.")
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path=WEBHOOK_PATH,
+            webhook_url=f"{PUBLIC_URL}/{WEBHOOK_PATH}",
+            drop_pending_updates=True,
+        )
+    else:
+        app.run_polling()
 
 async def inline_button_handler(update, context):
     query = update.callback_query
