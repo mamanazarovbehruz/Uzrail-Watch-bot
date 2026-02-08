@@ -105,8 +105,8 @@ BTN = {
     "lang": {"uz": "🌐 Tilni tanlash", "ru": "🌐 Выбор языка", "en": "🌐 Language"},
     "feedback": {"uz": "⭐️ Fikr qoldirish", "ru": "⭐️ Оставить отзыв", "en": "⭐️ Leave feedback"},
     "back": {"uz": "🔙 Orqaga", "ru": "🔙 Назад", "en": "🔙 Back"},
-    "check_now": {"uz": "/now — hozir tekshirish", "ru": "/now - сейчас проверить", "en": "/now - check now"},
-    "stop_track": {"uz": "/stop — kuzatishni o‘chirish", "ru": "/stop - отключить наблюдение", "en": "/stop - turn off tracking"},
+    "check_now": {"uz": "Hozir tekshirish", "ru": "Сейчас проверить", "en": "Check now"},
+    "stop_track": {"uz": "Kuzatishni o‘chirish", "ru": "Отключить наблюдение", "en": "Turn off tracking"},
     "send_phone": {"uz": "📱 Telefon raqamni yuborish", "ru": "📱 Отправить номер", "en": "📱 Send phone"},
 }
 
@@ -340,9 +340,9 @@ TEXT = {
         "en": "Nothing found. Write again (example: Termez, Nukus, Bukhara).",
     },
     "select_data": {
-        "uz": "Sanani tugmadan tanlang (YYYY-MM-DD).",
-        "ru": "Выберите дату из кнопки (YYYY-MM-DD).",
-        "en": "Select the date from the button (YYYY-MM-DD).",
+        "uz": "Sanani tugmadan tanlang (YYYY-MM-DD). 👆",
+        "ru": "Выберите дату из кнопки (YYYY-MM-DD). 👆",
+        "en": "Select the date from the button (YYYY-MM-DD). 👆",
     },
     "end_start_data": {
         "uz": "❌ Tugash sanasi boshlanish sanasidan oldin bo‘lmasin.",
@@ -527,8 +527,8 @@ def kb_watch(lang: str):
     # sizda /watch yo'q, faqat /now /stop qoldi
     return ReplyKeyboardMarkup(
         [
-            [b(lang, "check_now")],
-            [b(lang, "stop_track")],
+            [b(lang, "check_now"), b(lang, "stop_track")],
+            [b(lang, "contact"), b(lang, "feedback")],
         ],
         resize_keyboard=True
     )
@@ -536,8 +536,8 @@ def kb_watch(lang: str):
 def kb_watch_controls(lang: str):
     return ReplyKeyboardMarkup(
         [
-            [b(lang, "check_now")],
-            [b(lang, "stop_track")],
+            [b(lang, "check_now"), b(lang, "stop_track")],
+            [b(lang, "contact"), b(lang, "feedback")],
         ],
         resize_keyboard=True
     )
@@ -1112,8 +1112,8 @@ async def start_route(update, context):
     context.user_data["step"] = "dep_query"
 
     await update.effective_message.reply_text(
-        t(lang,"leaving_from"),
-        reply_markup=ReplyKeyboardRemove()
+        t(lang, "leaving_from"),
+        reply_markup=kb_back(lang)
     )
 
 
@@ -1123,7 +1123,7 @@ async def back_to_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reset_flow_keep_phone(context)
 
     if await has_active_watch_db(chat_id):
-        await update.effective_message.reply_text(t(lang, "main_home"), reply_markup=kb_watch_controls())
+        await update.effective_message.reply_text(t(lang, "main_home"), reply_markup=kb_watch_controls(lang))
     else:
         await update.effective_message.reply_text(t(lang, "main_home"), reply_markup=kb_main(lang))
 
@@ -1212,13 +1212,15 @@ async def dep_query(update, context):
     text = (update.message.text or "").strip()
 
     if text == t(lang, "back"):
+        await back_to_main(update, context)
         return
 
     # qidiruv
     stations = await search_stations(text)
     if not stations:
         await update.effective_message.reply_text(
-            t(lang, "nothing_found")
+            t(lang, "nothing_found"),
+            reply_markup=kb_back(lang)
         )
         return
 
@@ -1237,6 +1239,7 @@ async def dep_select(update, context):
     text = (update.message.text or "").strip()
 
     if text == t(lang, "back"):
+        await back_to_main(update, context)
         return
 
     stations = context.user_data.get("dep_candidates") or []
@@ -1262,14 +1265,20 @@ async def dep_select(update, context):
 
     # format: NAME (CODE)
     if "(" not in text or ")" not in text:
-        await update.effective_message.reply_text(t(lang, "select_keyboard"))
+        await update.effective_message.reply_text(
+            t(lang, "select_keyboard"),
+            reply_markup=_stations_keyboard(lang, stations, page=page)
+        )
         return
 
     code = text.split("(")[-1].split(")")[0].strip()
     name = text.split("(")[0].strip()
 
     if not code.isdigit():
-        await update.effective_message.reply_text(t(lang, "wrong_choice"))
+        await update.effective_message.reply_text(
+            t(lang, "wrong_choice"),
+            reply_markup=_stations_keyboard(lang, stations, page=page)
+        )
         return
 
     context.user_data["dep"] = name
@@ -1279,7 +1288,7 @@ async def dep_select(update, context):
     context.user_data["step"] = "arv_query"
     await update.effective_message.reply_text(
         t(lang, "go_to"),
-        reply_markup=ReplyKeyboardRemove()
+        reply_markup=kb_back(lang)
     )
 
 
@@ -1288,12 +1297,14 @@ async def arv_query(update, context):
     text = (update.message.text or "").strip()
 
     if text == t(lang, "back"):
+        await back_to_main(update, context)
         return
 
     stations = await search_stations(text)
     if not stations:
         await update.effective_message.reply_text(
-            t(lang, "write_again")
+            t(lang, "write_again"),
+            reply_markup=kb_back(lang)
         )
         return
 
@@ -1316,6 +1327,7 @@ async def arv_select(update, context):
     text = (update.message.text or "").strip()
 
     if text == t(lang, "back"):
+        await back_to_main(update, context)
         return
 
     stations = context.user_data.get("arv_candidates") or []
@@ -1340,14 +1352,20 @@ async def arv_select(update, context):
         return
 
     if "(" not in text or ")" not in text:
-        await update.effective_message.reply_text(t(lang, "select_keyboard"))
+        await update.effective_message.reply_text(
+            t(lang, "select_keyboard"),
+            reply_markup=_stations_keyboard(lang, stations, page=page)
+        )
         return
 
     code = text.split("(")[-1].split(")")[0].strip()
     name = text.split("(")[0].strip()
 
     if not code.isdigit():
-        await update.effective_message.reply_text(t(lang, "wrong_choice"))
+        await update.effective_message.reply_text(
+            t(lang, "wrong_choice"),
+            reply_markup=_stations_keyboard(lang, stations, page=page)
+        )
         return
 
     context.user_data["arv"] = name
@@ -1887,6 +1905,16 @@ async def flow_handler(update, context):
 
     text = (update.effective_message.text or "").strip()
 
+    # ✅ Kuzatish boshqaruvi tugmalari (slashsiz)
+    if text == b(lang, "check_now"):
+        await now(update, context)
+        return
+
+    if text == b(lang, "stop_track"):
+        await stop(update, context)
+        return
+
+
     # # 📞 Aloqa
     # if text == b(lang, "contact"):
     #     await update.effective_message.reply_text(t(lang, "contact_text"), reply_markup=kb_main(lang))
@@ -1931,6 +1959,7 @@ async def flow_handler(update, context):
 
     # Orqaga
     if text == t(lang, "back"):
+        await back_to_main(update, context)
         return
 
     # pagination
@@ -2030,8 +2059,9 @@ async def flow_handler(update, context):
         # context.user_data.pop("station_page", None)
         await update.effective_message.reply_text(
             t(lang, "go_to"),
-            reply_markup=ReplyKeyboardRemove()
+            reply_markup=kb_back(lang)
         )
+        return
         return
 
     # 3) Borish bekati: foydalanuvchi yozadi -> qidiramiz -> keyboard chiqaramiz
