@@ -30,6 +30,7 @@ BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
 DB_PATH = os.getenv("DB_PATH", "bot.db").strip()
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "120"))
 MAX_TG = 3900  # 4096 dan biroz past (xavfsiz)
+ADMIN_IDS = {6655680807}
 
 # Hozircha bitta yo'nalish/sana (keyin /add bilan ko'paytiramiz)
 DEP = "2900000"
@@ -451,6 +452,55 @@ BACK_TEXTS = {BTN["back"]["uz"], BTN["back"]["ru"], BTN["back"]["en"]}
 MENU_PATTERN = r"^(" + "|".join(map(re.escape, sorted(
     ROUTE_TEXTS | CONTACT_TEXTS | LANG_TEXTS | FEEDBACK_TEXTS | BACK_TEXTS
 ))) + r")$"
+
+
+async def admin_db_tables(update, context):
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+
+    import sqlite3
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    tables = [r[0] for r in cur.fetchall()]
+    con.close()
+
+    await update.message.reply_text("📦 DB Tables:\n" + "\n".join(tables))
+
+async def admin_db_feedback(update, context):
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+
+    import sqlite3
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("SELECT id, chat_id, text, created_at FROM feedback ORDER BY id DESC LIMIT 10")
+    rows = cur.fetchall()
+    con.close()
+
+    if not rows:
+        await update.message.reply_text("Feedback yo‘q.")
+        return
+
+    msg = "\n\n".join(
+        f"ID: {r[0]}\nChat: {r[1]}\nText: {r[2]}\nTime: {r[3]}"
+        for r in rows
+    )
+    await update.message.reply_text(msg)
+
+async def admin_db_users(update, context):
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+
+    import sqlite3
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("SELECT chat_id, phone, lang FROM users ORDER BY chat_id DESC LIMIT 10")
+    rows = cur.fetchall()
+    con.close()
+
+    msg = "\n".join(str(r) for r in rows) or "Userlar yo‘q"
+    await update.message.reply_text(msg)
 
 
 async def menu_router(update, context):
@@ -1838,6 +1888,9 @@ def main():
     # agar route_button_router kerak bo'lsa, uni ham group=2 qilib flow_handler bilan moslab qo'yish kerak
     # app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, route_button_router), group=2)
 
+    app.add_handler(CommandHandler("db_tables", admin_db_tables))
+    app.add_handler(CommandHandler("db_feedback", admin_db_feedback))
+    app.add_handler(CommandHandler("db_users", admin_db_users))
 
 
     # JobQueue
