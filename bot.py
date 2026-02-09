@@ -469,6 +469,10 @@ async def menu_router(update, context):
         return
 
     if txt in FEEDBACK_TEXTS:
+        lang = await get_lang(update, context)
+        chat_id = update.effective_chat.id
+        # qayerdan bosilganini eslab qolamiz
+        context.user_data["fb_from"] = "watch" if await has_active_watch_db(chat_id) else "main"
         await feedback_handler(update, context)
         return
 
@@ -1776,9 +1780,16 @@ async def lang_handler(update, context):
 async def feedback_handler(update, context):
     lang = await get_lang(update, context)
     context.user_data["step"] = "feedback"
+
+    # qayerdan kelgan bo'lsa o'sha keyboardni saqlab turamiz
+    if context.user_data.get("fb_from") == "watch":
+        markup = kb_watch_controls(lang)
+    else:
+        markup = kb_main(lang)
+
     await update.effective_message.reply_text(
         t(lang, "feedback_ask"),
-        reply_markup=kb_back(lang)
+        reply_markup=kb_back(lang)   # ✅ faqat Orqaga
     )
 
 
@@ -1869,10 +1880,23 @@ async def flow_handler(update, context):
     # ⭐️ feedback rejimi
     if context.user_data.get("step") == "feedback":
         text = (update.effective_message.text or "").strip()
-        # "Orqaga" bosilsa feedback yozmaymiz
+
+        chat_id = update.effective_chat.id
+
+        def _fb_markup():
+            # watch controlsdan kelgan bo'lsa - o'sha joyda qoladi
+            return kb_watch_controls(lang) if context.user_data.get("fb_from") == "watch" else kb_main(lang)
+    
+         # "Orqaga" bosilsa feedback yozmaymiz
         if text == b(lang, "back"):
+            src = context.user_data.get("fb_from", "main")
             context.user_data["step"] = None
-            await update.effective_message.reply_text(t(lang, "main_home"), reply_markup=kb_main(lang))
+            context.user_data.pop("fb_from", None)
+
+            if src == "watch":
+                await update.effective_message.reply_text(t(lang, "main_home"), reply_markup=kb_watch_controls(lang))
+            else:
+                await update.effective_message.reply_text(t(lang, "main_home"), reply_markup=kb_main(lang))
             return
 
         # Menu tugmalarini feedback deb qabul qilmaymiz
@@ -1890,12 +1914,22 @@ async def flow_handler(update, context):
         
         # bo‘sh xabar bo‘lsa ham qabul qilmaymiz
         if not text:
-            await update.effective_message.reply_text(t(lang, "feedback_prompt"), reply_markup=kb_main(lang))
+            if context.user_data.get("fb_from") == "watch":
+                await update.effective_message.reply_text(t(lang, "feedback_ask"), reply_markup=kb_watch_controls(lang))
+            else:
+                await update.effective_message.reply_text(t(lang, "feedback_ask"), reply_markup=kb_main(lang))
             return
         
+        src = context.user_data.get("fb_from", "main")
         context.user_data["step"] = None
-        await add_feedback(DB_PATH, update.effective_chat.id, text)
-        await update.effective_message.reply_text(t(lang, "feedback_ok"), reply_markup=kb_main(lang))
+        context.user_data.pop("fb_from", None)
+
+        await add_feedback(DB_PATH, chat_id, text)
+
+        if src == "watch":
+            await update.effective_message.reply_text(t(lang, "feedback_ok"), reply_markup=kb_watch_controls(lang))
+        else:
+            await update.effective_message.reply_text(t(lang, "feedback_ok"), reply_markup=kb_main(lang))
         return
     step = context.user_data.get("step")
 
