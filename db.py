@@ -1,238 +1,250 @@
-# db.py
-import aiosqlite
+# db.py (PostgreSQL version)
+import os
+import asyncpg
 from datetime import datetime, timezone
+
+_POOL: asyncpg.Pool | None = None
 
 def now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
-CREATE_SQL = """
-PRAGMA journal_mode=WAL;
-PRAGMA synchronous=NORMAL;
+def _db_url() -> str:
+    url = (os.getenv("DATABASE_URL") or "").strip()
+    if not url:
+        raise RuntimeError("DATABASE_URL topilmadi. Railway Postgres -> Variables dan bot service ga DATABASE_URL bering.")
+    # asyncpg 'postgres://' ni ham tushunadi, lekin Railway odatda 'postgresql://' beradi
+    return url
 
+async def get_pool() -> asyncpg.Pool:
+    global _POOL
+    if _POOL is None:
+        _POOL = await asyncpg.create_pool(
+            dsn=_db_url(),
+            min_size=1,
+            max_size=5,
+            command_timeout=60,
+        )
+    return _POOL
+
+CREATE_SQL = """
 CREATE TABLE IF NOT EXISTS users (
-  chat_id      INTEGER PRIMARY KEY,
-  user_id      INTEGER,
+  chat_id      BIGINT PRIMARY KEY,
+  user_id      BIGINT,
   username     TEXT,
   first_name   TEXT,
   last_name    TEXT,
   phone        TEXT,
-  registered   INTEGER DEFAULT 0,
+  registered   BOOLEAN DEFAULT FALSE,
   lang         TEXT DEFAULT 'uz',
   first_seen   TEXT,
   last_seen    TEXT,
   plan         TEXT DEFAULT 'free',
   plan_expires TEXT,
-  blocked      INTEGER DEFAULT 0
+  blocked      BOOLEAN DEFAULT FALSE
 );
 
 CREATE INDEX IF NOT EXISTS idx_users_last_seen ON users(last_seen);
 
 CREATE TABLE IF NOT EXISTS watches (
-  chat_id    INTEGER PRIMARY KEY,
-  enabled    INTEGER DEFAULT 0,
-  dep_code   TEXT,
-  arv_code   TEXT,
-  dep_name   TEXT,
-  arv_name   TEXT,
-  date_from  TEXT,
-  date_to    TEXT,
-  snapshot_json TEXT,
-  snapshot_hash TEXT,
-  updated_at TEXT,
-  FOREIGN KEY(chat_id) REFERENCES users(chat_id)
+  chat_id        BIGINT PRIMARY KEY,
+  enabled        BOOLEAN DEFAULT FALSE,
+  dep_code       TEXT,
+  arv_code       TEXT,
+  dep_name       TEXT,
+  arv_name       TEXT,
+  date_from      TEXT,
+  date_to        TEXT,
+  snapshot_json  TEXT,
+  snapshot_hash  TEXT,
+  updated_at     TEXT,
+  CONSTRAINT fk_watches_user FOREIGN KEY(chat_id) REFERENCES users(chat_id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS feedbacks (
-  id         INTEGER PRIMARY KEY AUTOINCREMENT,
-  chat_id    INTEGER NOT NULL,
+  id         BIGSERIAL PRIMARY KEY,
+  chat_id    BIGINT NOT NULL,
   text       TEXT NOT NULL,
   created_at TEXT NOT NULL,
-  FOREIGN KEY(chat_id) REFERENCES users(chat_id)
+  CONSTRAINT fk_feedbacks_user FOREIGN KEY(chat_id) REFERENCES users(chat_id) ON DELETE CASCADE
 );
 
 CREATE INDEX IF NOT EXISTS idx_feedbacks_chat_id ON feedbacks(chat_id);
 """
 
-async def _ensure_column(db, table: str, column: str, ddl: str):
-    cur = await db.execute(f"PRAGMA table_info({table})")
-    cols = [r[1] for r in await cur.fetchall()]
-    if column not in cols:
-        await db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+async def init_db(_db_path_ignored: str | None = None):
+    pool = await get_pool()
+    async with pool.acquire() as con:
+        await con.execute(CREATE_SQL)
 
-async def init_db(db_path: str):
-    async with aiosqlite.connect(db_path) as db:
-        await db.executescript(CREATE_SQL)
+# =========================
+# USERS
+# =========================
 
-        # ✅ eski DB bo‘lsa ham yangi ustun qo‘shib oladi
-        await _ensure_column(db, "users", "lang", "TEXT DEFAULT 'uz'")
-
-        # ✅ feedbacks jadvali yo‘q bo‘lsa yaratib oladi
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS feedbacks (
-              id         INTEGER PRIMARY KEY AUTOINCREMENT,
-              chat_id    INTEGER NOT NULL,
-              text       TEXT NOT NULL,
-              created_at TEXT NOT NULL,
-              FOREIGN KEY(chat_id) REFERENCES users(chat_id)
-            )
-            """
-        )
-        await db.execute("CREATE INDEX IF NOT EXISTS idx_feedbacks_chat_id ON feedbacks(chat_id)")
-        await db.commit()
+async def get_lang(db_path: str, chat_id: int) -> str | None:
+    pool = await get_pool()
+    async with pool.acquire() as con:
+        row = await con.fetchrow("SELECT lang FROM users WHERE chat_id=$1", chat_id)
+        return row["lang"] if row and row["lang"] else None
 
 async def set_lang(db_path: str, chat_id: int, lang: str):
     lang = (lang or "uz").lower()
     if lang not in ("uz", "ru", "en"):
         lang = "uz"
-    async with aiosqlite.connect(db_path) as db:
-        await db.execute("UPDATE users SET lang=?, last_seen=? WHERE chat_id=?", (lang, now_utc_iso(), chat_id))
-        await db.commit()
-
-async def get_lang(db_path: str, chat_id: int) -> str | None:
-    async with aiosqlite.connect(db_path) as db:
-        cur = await db.execute("SELECT lang FROM users WHERE chat_id=?", (chat_id,))
-        row = await cur.fetchone()
-        return row[0] if row and row[0] else None
+    pool = await get_pool()
+    async with pool.acquire() as con:
+        await con.execute(
+            "UPDATE users SET lang=$1, last_seen=$2 WHERE chat_id=$3",
+            lang, now_utc_iso(), chat_id
+        )
 
 async def upsert_user(db_path: str, chat_id: int, user_id: int | None, username: str | None,
                       first_name: str | None, last_name: str | None):
     now = now_utc_iso()
-    async with aiosqlite.connect(db_path) as db:
-        # mavjud bo'lsa yangilaydi, yo'q bo'lsa yaratadi
-        await db.execute(
+    pool = await get_pool()
+    async with pool.acquire() as con:
+        await con.execute(
             """
             INSERT INTO users(chat_id, user_id, username, first_name, last_name, first_seen, last_seen)
-            VALUES(?,?,?,?,?,?,?)
-            ON CONFLICT(chat_id) DO UPDATE SET
-              user_id=COALESCE(excluded.user_id, users.user_id),
-              username=COALESCE(excluded.username, users.username),
-              first_name=COALESCE(excluded.first_name, users.first_name),
-              last_name=COALESCE(excluded.last_name, users.last_name),
-              last_seen=excluded.last_seen
+            VALUES($1,$2,$3,$4,$5,$6,$7)
+            ON CONFLICT (chat_id) DO UPDATE SET
+              user_id=COALESCE(EXCLUDED.user_id, users.user_id),
+              username=COALESCE(EXCLUDED.username, users.username),
+              first_name=COALESCE(EXCLUDED.first_name, users.first_name),
+              last_name=COALESCE(EXCLUDED.last_name, users.last_name),
+              last_seen=EXCLUDED.last_seen
             """,
-            (chat_id, user_id, username, first_name, last_name, now, now),
+            chat_id, user_id, username, first_name, last_name, now, now
         )
-        await db.commit()
 
 async def touch_last_seen(db_path: str, chat_id: int):
-    async with aiosqlite.connect(db_path) as db:
-        await db.execute("UPDATE users SET last_seen=? WHERE chat_id=?", (now_utc_iso(), chat_id))
-        await db.commit()
+    pool = await get_pool()
+    async with pool.acquire() as con:
+        await con.execute(
+            "UPDATE users SET last_seen=$1 WHERE chat_id=$2",
+            now_utc_iso(), chat_id
+        )
 
 async def set_phone(db_path: str, chat_id: int, phone: str):
-    async with aiosqlite.connect(db_path) as db:
-        await db.execute(
-            "UPDATE users SET phone=?, registered=1, last_seen=? WHERE chat_id=?",
-            (phone, now_utc_iso(), chat_id),
+    pool = await get_pool()
+    async with pool.acquire() as con:
+        await con.execute(
+            "UPDATE users SET phone=$1, registered=TRUE, last_seen=$2 WHERE chat_id=$3",
+            phone, now_utc_iso(), chat_id
         )
-        await db.commit()
 
 async def get_phone(db_path: str, chat_id: int) -> str | None:
-    async with aiosqlite.connect(db_path) as db:
-        cur = await db.execute("SELECT phone FROM users WHERE chat_id=?", (chat_id,))
-        row = await cur.fetchone()
-        return row[0] if row and row[0] else None
+    pool = await get_pool()
+    async with pool.acquire() as con:
+        row = await con.fetchrow("SELECT phone FROM users WHERE chat_id=$1", chat_id)
+        return row["phone"] if row and row["phone"] else None
+
+async def list_all_users(db_path: str):
+    pool = await get_pool()
+    async with pool.acquire() as con:
+        rows = await con.fetch(
+            "SELECT chat_id, phone, lang FROM users ORDER BY chat_id DESC LIMIT 200"
+        )
+        return [(int(r["chat_id"]), r["phone"], r["lang"]) for r in rows]
+
+# =========================
+# WATCHES
+# =========================
 
 async def save_watch(db_path: str, chat_id: int, data: dict):
-    # data: enabled, dep_code, arv_code, dep_name, arv_name, date_from, date_to, snapshot_json, snapshot_hash
     now = now_utc_iso()
-    async with aiosqlite.connect(db_path) as db:
-        await db.execute(
+    pool = await get_pool()
+    async with pool.acquire() as con:
+        await con.execute(
             """
-            INSERT INTO watches(chat_id, enabled, dep_code, arv_code, dep_name, arv_name, date_from, date_to,
-                                snapshot_json, snapshot_hash, updated_at)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(chat_id) DO UPDATE SET
-              enabled=excluded.enabled,
-              dep_code=excluded.dep_code,
-              arv_code=excluded.arv_code,
-              dep_name=excluded.dep_name,
-              arv_name=excluded.arv_name,
-              date_from=excluded.date_from,
-              date_to=excluded.date_to,
-              snapshot_json=excluded.snapshot_json,
-              snapshot_hash=excluded.snapshot_hash,
-              updated_at=excluded.updated_at
+            INSERT INTO watches(
+              chat_id, enabled, dep_code, arv_code, dep_name, arv_name, date_from, date_to,
+              snapshot_json, snapshot_hash, updated_at
+            )
+            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+            ON CONFLICT (chat_id) DO UPDATE SET
+              enabled=EXCLUDED.enabled,
+              dep_code=EXCLUDED.dep_code,
+              arv_code=EXCLUDED.arv_code,
+              dep_name=EXCLUDED.dep_name,
+              arv_name=EXCLUDED.arv_name,
+              date_from=EXCLUDED.date_from,
+              date_to=EXCLUDED.date_to,
+              snapshot_json=EXCLUDED.snapshot_json,
+              snapshot_hash=EXCLUDED.snapshot_hash,
+              updated_at=EXCLUDED.updated_at
             """,
-            (
-                chat_id,
-                int(bool(data.get("enabled"))),
-                data.get("dep_code"),
-                data.get("arv_code"),
-                data.get("dep_name"),
-                data.get("arv_name"),
-                data.get("date_from"),
-                data.get("date_to"),
-                data.get("snapshot_json"),
-                data.get("snapshot_hash"),
-                now,
-            ),
+            chat_id,
+            bool(data.get("enabled")),
+            data.get("dep_code"),
+            data.get("arv_code"),
+            data.get("dep_name"),
+            data.get("arv_name"),
+            data.get("date_from"),
+            data.get("date_to"),
+            data.get("snapshot_json"),
+            data.get("snapshot_hash"),
+            now,
         )
-        await db.commit()
 
 async def get_watch(db_path: str, chat_id: int) -> dict | None:
-    async with aiosqlite.connect(db_path) as db:
-        cur = await db.execute(
+    pool = await get_pool()
+    async with pool.acquire() as con:
+        row = await con.fetchrow(
             """
-            SELECT enabled, dep_code, arv_code, dep_name, arv_name, date_from, date_to, snapshot_json, snapshot_hash
-            FROM watches WHERE chat_id=?
+            SELECT chat_id, enabled, dep_code, arv_code, dep_name, arv_name,
+                   date_from, date_to, snapshot_json, snapshot_hash
+            FROM watches
+            WHERE chat_id=$1
             """,
-            (chat_id,),
+            chat_id
         )
-        row = await cur.fetchone()
         if not row:
             return None
         return {
-            "enabled": bool(row[0]),
-            "dep_code": row[1],
-            "arv_code": row[2],
-            "dep_name": row[3],
-            "arv_name": row[4],
-            "date_from": row[5],
-            "date_to": row[6],
-            "snapshot_json": row[7],
-            "snapshot_hash": row[8],
+            "chat_id": int(row["chat_id"]),
+            "enabled": bool(row["enabled"]),
+            "dep_code": row["dep_code"],
+            "arv_code": row["arv_code"],
+            "dep_name": row["dep_name"],
+            "arv_name": row["arv_name"],
+            "date_from": row["date_from"],
+            "date_to": row["date_to"],
+            "snapshot_json": row["snapshot_json"],
+            "snapshot_hash": row["snapshot_hash"],
         }
 
 async def set_watch_enabled(db_path: str, chat_id: int, enabled: bool):
-    async with aiosqlite.connect(db_path) as db:
-        await db.execute(
-            "INSERT INTO watches(chat_id, enabled, updated_at) VALUES(?,?,?) "
-            "ON CONFLICT(chat_id) DO UPDATE SET enabled=?, updated_at=?",
-            (chat_id, int(enabled), now_utc_iso(), int(enabled), now_utc_iso()),
+    pool = await get_pool()
+    async with pool.acquire() as con:
+        await con.execute(
+            "UPDATE watches SET enabled=$1, updated_at=$2 WHERE chat_id=$3",
+            bool(enabled), now_utc_iso(), chat_id
         )
-        await db.commit()
 
-async def list_all_users(db_path: str) -> list[int]:
-    async with aiosqlite.connect(db_path) as db:
-        cur = await db.execute("SELECT chat_id FROM users WHERE blocked=0")
-        rows = await cur.fetchall()
-        return [r[0] for r in rows]
-
-async def list_enabled_watches(db_path: str) -> list[dict]:
-    async with aiosqlite.connect(db_path) as db:
-        cur = await db.execute(
+async def list_enabled_watches(db_path: str):
+    pool = await get_pool()
+    async with pool.acquire() as con:
+        rows = await con.fetch(
             """
-            SELECT chat_id, enabled, dep_code, arv_code, dep_name, arv_name, date_from, date_to, snapshot_json, snapshot_hash
+            SELECT chat_id, enabled, dep_code, arv_code, dep_name, arv_name,
+                   date_from, date_to, snapshot_json, snapshot_hash
             FROM watches
-            WHERE enabled=1
+            WHERE enabled=TRUE
             """
         )
-        rows = await cur.fetchall()
         out = []
         for r in rows:
             out.append({
-                "chat_id": r[0],
-                "enabled": bool(r[1]),
-                "dep_code": r[2],
-                "arv_code": r[3],
-                "dep_name": r[4],
-                "arv_name": r[5],
-                "date_from": r[6],
-                "date_to": r[7],
-                "snapshot_json": r[8],
-                "snapshot_hash": r[9],
+                "chat_id": int(r["chat_id"]),
+                "enabled": bool(r["enabled"]),
+                "dep_code": r["dep_code"],
+                "arv_code": r["arv_code"],
+                "dep_name": r["dep_name"],
+                "arv_name": r["arv_name"],
+                "date_from": r["date_from"],
+                "date_to": r["date_to"],
+                "snapshot_json": r["snapshot_json"],
+                "snapshot_hash": r["snapshot_hash"],
             })
         return out
 
@@ -241,39 +253,24 @@ async def list_enabled_watches(db_path: str) -> list[dict]:
 # =========================
 
 async def get_user_lang(db_path: str, chat_id: int) -> str:
-    async with aiosqlite.connect(db_path) as db:
-        cur = await db.execute(
-            "SELECT lang FROM users WHERE chat_id=?",
-            (chat_id,)
-        )
-        row = await cur.fetchone()
-        lang = (row[0] if row and row[0] else "uz").lower()
-        return lang if lang in ("uz", "ru", "en") else "uz"
+    lang = await get_lang(db_path, chat_id)
+    lang = (lang or "uz").lower()
+    return lang if lang in ("uz", "ru", "en") else "uz"
 
 async def set_user_lang(db_path: str, chat_id: int, lang: str):
-    lang = (lang or "uz").lower()
-    if lang not in ("uz", "ru", "en"):
-        lang = "uz"
-
-    async with aiosqlite.connect(db_path) as db:
-        await db.execute(
-            "UPDATE users SET lang=?, last_seen=? WHERE chat_id=?",
-            (lang, now_utc_iso(), chat_id)
-        )
-        await db.commit()
+    await set_lang(db_path, chat_id, lang)
 
 async def add_feedback(db_path: str, chat_id: int, text: str):
     text = (text or "").strip()
     if not text:
         return
-
-    async with aiosqlite.connect(db_path) as db:
-        await db.execute(
-            "INSERT INTO feedbacks(chat_id, text, created_at) VALUES(?,?,?)",
-            (chat_id, text, now_utc_iso()),
+    pool = await get_pool()
+    async with pool.acquire() as con:
+        await con.execute(
+            "INSERT INTO feedbacks(chat_id, text, created_at) VALUES($1,$2,$3)",
+            chat_id, text, now_utc_iso()
         )
-        await db.execute(
-            "UPDATE users SET last_seen=? WHERE chat_id=?",
-            (now_utc_iso(), chat_id),
+        await con.execute(
+            "UPDATE users SET last_seen=$1 WHERE chat_id=$2",
+            now_utc_iso(), chat_id
         )
-        await db.commit()

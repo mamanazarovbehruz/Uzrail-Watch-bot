@@ -15,7 +15,8 @@ from db import (
     set_phone, get_phone,
     save_watch, get_watch, set_watch_enabled,
     list_all_users, list_enabled_watches,
-    get_user_lang, set_user_lang, add_feedback
+    get_user_lang, set_user_lang, add_feedback,
+    get_pool
 )
 import asyncio
 from telegram.error import BadRequest
@@ -458,32 +459,36 @@ async def admin_db_tables(update, context):
     if update.effective_user.id not in ADMIN_IDS:
         return
 
-    import sqlite3
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
-    tables = [r[0] for r in cur.fetchall()]
-    con.close()
-
-    await update.message.reply_text("📦 DB Tables:\n" + "\n".join(tables))
+    pool = await get_pool()
+    async with pool.acquire() as con:
+        rows = await con.fetch("""
+            SELECT tablename
+            FROM pg_catalog.pg_tables
+            WHERE schemaname='public'
+            ORDER BY tablename
+        """)
+    tables = [r["tablename"] for r in rows]
+    await update.message.reply_text("📦 DB Tables:\n" + "\n".join(tables) if tables else "Jadval yo‘q.")
 
 async def admin_db_feedback(update, context):
     if update.effective_user.id not in ADMIN_IDS:
         return
 
-    import sqlite3
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    cur.execute("SELECT id, chat_id, text, created_at FROM feedback ORDER BY id DESC LIMIT 10")
-    rows = cur.fetchall()
-    con.close()
+    pool = await get_pool()
+    async with pool.acquire() as con:
+        rows = await con.fetch("""
+            SELECT id, chat_id, text, created_at
+            FROM feedbacks
+            ORDER BY id DESC
+            LIMIT 10
+        """)
 
     if not rows:
         await update.message.reply_text("Feedback yo‘q.")
         return
 
     msg = "\n\n".join(
-        f"ID: {r[0]}\nChat: {r[1]}\nText: {r[2]}\nTime: {r[3]}"
+        f"ID: {r['id']}\nChat: {r['chat_id']}\nText: {r['text']}\nTime: {r['created_at']}"
         for r in rows
     )
     await update.message.reply_text(msg)
@@ -492,13 +497,7 @@ async def admin_db_users(update, context):
     if update.effective_user.id not in ADMIN_IDS:
         return
 
-    import sqlite3
-    con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    cur.execute("SELECT chat_id, phone, lang FROM users ORDER BY chat_id DESC LIMIT 10")
-    rows = cur.fetchall()
-    con.close()
-
+    rows = await list_all_users(DB_PATH)
     msg = "\n".join(str(r) for r in rows) or "Userlar yo‘q"
     await update.message.reply_text(msg)
 
@@ -1867,7 +1866,7 @@ def main():
     app.add_error_handler(error_handler)
 
     # 0-group: middleware (hamma update)
-    app.add_handler(MessageHandler(filters.ALL, activity_middleware), group=0)
+    app.add_handler(MessageHandler(~filters.COMMAND, activity_middleware), group=0)
 
     # 1-group: asosiy handlerlar (start ishlashi uchun)
     app.add_handler(CommandHandler("start", start), group=1)
@@ -1888,9 +1887,9 @@ def main():
     # agar route_button_router kerak bo'lsa, uni ham group=2 qilib flow_handler bilan moslab qo'yish kerak
     # app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, route_button_router), group=2)
 
-    app.add_handler(CommandHandler("db_tables", admin_db_tables))
-    app.add_handler(CommandHandler("db_feedback", admin_db_feedback))
-    app.add_handler(CommandHandler("db_users", admin_db_users))
+    app.add_handler(CommandHandler("db_tables", admin_db_tables), group=1)
+    app.add_handler(CommandHandler("db_feedback", admin_db_feedback), group=1)
+    app.add_handler(CommandHandler("db_users", admin_db_users), group=1)
 
 
     # JobQueue
