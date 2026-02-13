@@ -2,6 +2,7 @@
 import os
 import asyncpg
 from datetime import datetime, timezone
+from urllib.parse import quote_plus
 
 _POOL: asyncpg.Pool | None = None
 
@@ -9,11 +10,18 @@ def now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 def _db_url() -> str:
+    # ✅ Lokal uchun: avval PUBLIC
+    public_url = (os.getenv("DATABASE_PUBLIC_URL") or "").strip()
+    if public_url:
+        return public_url
+
+    # ✅ Railway uchun: keyin INTERNAL
     url = (os.getenv("DATABASE_URL") or "").strip()
-    if not url:
-        raise RuntimeError("DATABASE_URL topilmadi. Railway Postgres -> Variables dan bot service ga DATABASE_URL bering.")
-    # asyncpg 'postgres://' ni ham tushunadi, lekin Railway odatda 'postgresql://' beradi
-    return url
+    if url:
+        return url
+
+    raise RuntimeError("DATABASE_PUBLIC_URL ham DATABASE_URL ham topilmadi.")
+
 
 async def get_pool() -> asyncpg.Pool:
     global _POOL
@@ -23,6 +31,7 @@ async def get_pool() -> asyncpg.Pool:
             min_size=1,
             max_size=5,
             command_timeout=60,
+            ssl="require",
         )
     return _POOL
 
@@ -79,6 +88,15 @@ async def init_db(_db_path_ignored: str | None = None):
 # =========================
 # USERS
 # =========================
+
+async def ensure_user_exists(chat_id: int):
+    pool = await get_pool()  # yoki get_pool() sizda qaysi nom bo'lsa
+    async with pool.acquire() as con:
+        await con.execute(
+            "INSERT INTO users(chat_id) VALUES($1) ON CONFLICT (chat_id) DO NOTHING",
+            chat_id
+        )
+
 
 async def get_lang(db_path: str, chat_id: int) -> str | None:
     pool = await get_pool()
@@ -151,6 +169,7 @@ async def list_all_users(db_path: str):
 # =========================
 
 async def save_watch(db_path: str, chat_id: int, data: dict):
+    await ensure_user_exists(chat_id)
     now = now_utc_iso()
     pool = await get_pool()
     async with pool.acquire() as con:
