@@ -3,7 +3,7 @@ import json
 import re
 from dotenv import load_dotenv
 import calendar
-from datetime import date, timedelta,datetime
+from datetime import date, timedelta,datetime, timezone
 from fetcher import fetch_trains, make_summary, search_stations
 from telegram import (
     Update, ReplyKeyboardMarkup, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton
@@ -19,7 +19,7 @@ from db import (
     get_pool
 )
 import asyncio
-from telegram.error import BadRequest
+from telegram.error import BadRequest, Forbidden
 
 
 
@@ -441,6 +441,16 @@ TEXT = {
         "ru": "❌ Остановка не выбрана. Пожалуйста, заново 📍 укажите направление.",
         "en": "❌ No stop has been selected. Please enter the 📍 Direction again.",
     },
+    "ticket_sales_stopped": {
+        "uz": "Bu poyezdda biletlar sotilishi to‘xtatildi",
+        "ru": "Продажа билетов на этот поезд остановлена",
+        "en": "Ticket sales for this train have stopped",
+    },
+    "watch_expired": {
+        "uz": "⏳ Kuzatuv sana muddati tugadi. Bosh sahifaga qaytdik 👇",
+        "ru": "⏳ Срок наблюдения по датам истёк. Возвращаю в главное меню 👇",
+        "en": "⏳ Tracking period has ended. Returning to the main menu 👇",
+    },
 }
 
 # --- MAIN MENU TEXTS (3 til) ---
@@ -780,11 +790,14 @@ def _watch_day_report(old_api: dict, new_api: dict, lang: str) -> str:
 
         # ✅ agar poyezd oldin bor edi, hozir umuman yo‘q — "yo'qoldi" deb chiqaramiz
         if num in old_map and num not in new_map:
+            # ✅ Ko‘pincha sotuv yopilganda API bu poyezdni ro‘yxatdan olib tashlaydi.
+            # Shuning uchun "0 ta joy" deb emas, "sotuv to‘xtatildi" deb chiqaramiz.
             idx += 1
             out.append(f"🚆 #{idx}:  {num}  {meta.get('from','')} → {meta.get('to','')}")
-            out.append(f"{t(lang, 'available_place')} 0 {t(lang, 'item')} {t(lang, 'place')} (➖{sum(int(v.get('free') or 0) for v in (old_cars or {}).values())})")
-            out.append("")  # bo'sh qator
+            out.append(t(lang, "ticket_sales_stopped"))
+            out.append("")  # bo‘sh qator
             continue
+
 
 
         # ✅ faqat 0dan katta joylarni hisoblaymiz
@@ -2441,13 +2454,20 @@ def diff_snapshot(old_api: dict, new_api: dict) -> bool:
     """
     return _safe_hash(old_api) != _safe_hash(new_api)
 
+async def safe_send(bot, chat_id: int, text: str, **kwargs) -> bool:
+    try:
+        await bot.send_message(chat_id=chat_id, text=text, **kwargs)
+        return True
+    except Forbidden:
+        return False
 
 
 async def watcher_job(context: ContextTypes.DEFAULT_TYPE):
     watches = await list_enabled_watches(DB_PATH)
     if not watches:
         return
-
+    
+    bot = context.application.bot
     for w in watches:
         chat_id = int(w["chat_id"])
 
@@ -2478,6 +2498,27 @@ async def watcher_job(context: ContextTypes.DEFAULT_TYPE):
 
         new_snapshot = {}
         changed_days = []
+
+        # ✅ Sana muddati tugagan bo‘lsa (oxirgi kundan keyingi kunda) — kuzatuvni o‘chirib, bosh menuga qaytamiz.
+        try:
+            # Server UTC bo‘lishi mumkin, UZ (+5) ga yaqinlashtiramiz
+            now_uz = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=5)))
+            end_day = date.fromisoformat(d_to)
+            if now_uz.date() > end_day:
+                await set_watch_enabled(DB_PATH, chat_id, False)
+                ok = await safe_send(
+                    bot,
+                    chat_id,
+                    t(lang, "watch_expired"),
+                    reply_markup=kb_main(lang),
+                )
+                if not ok:
+                    # user botni bloklagan bo‘lsa ham — endi watch o‘chdi, shunchaki davom etamiz
+                    continue
+                continue
+        except Exception:
+            pass
+
 
         for d in iter_dates(d_from, d_to):
             try:
@@ -2515,16 +2556,22 @@ async def watcher_job(context: ContextTypes.DEFAULT_TYPE):
                 text += day_report
 
             if not has_any:
-                continue
+                # snapshot baribir yangilansin (quyida save bo‘ladi)
+                pass
+            else:
+                text += f"\n\n {t(lang, "continue_observe")}"
 
-            text += f"\n\n {t(lang, "continue_observe")}"
-
-            for i in range(0, len(text), 3900):
-                await context.application.bot.send_message(
-                    chat_id=chat_id,
-                    text=text[i:i+3900],   # ✅ shu yer muhim
-                    reply_markup=buy_ticket_kb(lang) if i == 0 else None,  # ✅ keyboard faqat 1-xabarda
-                )
+                for i in range(0, len(text), 3900):
+                    ok = await safe_send(
+                        bot,
+                        chat_id,
+                        text[i:i + 3900],
+                        reply_markup=buy_ticket_kb(lang) if i == 0 else None,
+                    )
+                    if not ok:
+                        # user botni bloklagan -> watchni o‘chirib qo‘yamiz, job qayta urunib yurmasin
+                        await set_watch_enabled(DB_PATH, chat_id, False)
+                        break
 
         # snapshotni DBga yangilab qo'yamiz
         await save_watch(DB_PATH, chat_id, {
