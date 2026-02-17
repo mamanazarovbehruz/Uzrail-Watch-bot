@@ -47,7 +47,8 @@ async def main():
     cur = make_summary(api)
 
     if os.path.exists(STATE_FILE):
-        prev = json.load(open(STATE_FILE, "r", encoding="utf-8"))
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            prev = json.load(f)
         changes = diff(prev, cur)
 
         if changes:
@@ -57,6 +58,7 @@ async def main():
     else:
         print("Birinchi ishga tushirish: holat saqlandi, hozircha xabar yo‘q.")
 
-    json.dump(cur, open(STATE_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(cur, f, ensure_ascii=False, indent=2)
 
 asyncio.run(main())

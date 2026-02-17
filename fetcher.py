@@ -111,17 +111,27 @@ async def _fetch_trains_manual(depStationCode, arvStationCode, date_iso, lang: s
     }
 
     headers = _manual_headers(lang)
-    async with httpx.AsyncClient(headers=headers, timeout=30, follow_redirects=True) as client:
-        r = await client.post(ENDPOINT, json=payload)
-        text = (r.text or "")[:300]
+    timeout_s = float(os.getenv("HTTP_TIMEOUT", "12"))  # 12s default
+    max_tries = int(os.getenv("HTTP_MAX_RETRIES", "3") or "3")
+    last_text = ""
+    for attempt in range(1, max_tries + 1):
+        async with httpx.AsyncClient(headers=headers, timeout=timeout_s, follow_redirects=True) as client:
+            r = await client.post(ENDPOINT, json=payload)
+            last_text = (r.text or "")[:300]
 
-        # ✅ 400/401/403/419 bo'lsa RuntimeError formatida qaytaramiz
-        # (fetch_trains() ichidagi refresh/retry shuni taniydi)
+        # cookie/xsrf muammolari (sening eski logikangga mos)
         if r.status_code in (400, 401, 403, 419):
-            raise RuntimeError(f"API status={r.status_code}. Body: {text}")
+            raise RuntimeError(f"API status={r.status_code}. Body: {last_text}")
+
+        # vaqtinchalik server muammolari -> retry
+        if r.status_code in (429, 502, 503, 504):
+            if attempt < max_tries:
+                await asyncio.sleep(0.7 * attempt)
+                continue
+            raise RuntimeError(f"API status={r.status_code}. Body: {last_text}")
 
         if r.status_code != 200:
-            raise RuntimeError(f"API status={r.status_code}. Body: {text}")
+            raise RuntimeError(f"API status={r.status_code}. Body: {last_text}")
 
         return r.json()
 

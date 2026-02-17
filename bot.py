@@ -19,7 +19,7 @@ from db import (
     get_pool
 )
 import asyncio
-from telegram.error import BadRequest, Forbidden
+from telegram.error import BadRequest, Forbidden, TimedOut, RetryAfter, NetworkError
 
 
 
@@ -32,15 +32,6 @@ DB_PATH = os.getenv("DB_PATH", "bot.db").strip()
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "120"))
 MAX_TG = 3900  # 4096 dan biroz past (xavfsiz)
 ADMIN_IDS = {6655680807}
-
-# Hozircha bitta yo'nalish/sana (keyin /add bilan ko'paytiramiz)
-DEP = "2900000"
-ARV = "2900864"
-DATE = "2026-01-30"
-
-STATE_FILE = f"state_{DEP}_{ARV}_{DATE}.json"
-
-STATIONS = ["Toshkent", "Samarqand", "Buxoro", "Andijon", "Termiz", "Qo‘qon"]
 
 
 async def send_long_text(update, text: str, *, chunk_size: int = MAX_TG, reply_markup=None):
@@ -1908,7 +1899,18 @@ def main():
     # JobQueue
     if app.job_queue is None:
         raise RuntimeError('JobQueue yo‘q. requirements.txt: python-telegram-bot[webhooks,job-queue]==21.10')
-    app.job_queue.run_repeating(watcher_job, interval=POLL_SECONDS, first=10)
+    app.job_queue.run_repeating(
+        watcher_job,
+        interval=POLL_SECONDS,
+        first=10,
+        name="watcher_job",
+        job_kwargs={
+            "max_instances": 1,         # bir vaqtda faqat 1 dona
+            "coalesce": True,           # agar kechiksa — yig‘ib yuboradi (navbat qilmaydi)
+            "misfire_grace_time": 60,   # 60s ichida o‘tib ketgan triggerlarni “kechikib” qabul qiladi
+        },
+    )
+
     
     print("Bot ishga tushdi...")
     USE_WEBHOOK = os.getenv("USE_WEBHOOK", "0") == "1"
@@ -2454,25 +2456,53 @@ def diff_snapshot(old_api: dict, new_api: dict) -> bool:
     """
     return _safe_hash(old_api) != _safe_hash(new_api)
 
-async def safe_send(bot, chat_id: int, text: str, **kwargs) -> bool:
-    try:
-        await bot.send_message(chat_id=chat_id, text=text, **kwargs)
-        return True
-    except Forbidden:
-        return False
+async def safe_send(bot, chat_id: int, text: str, retries: int = 3, **kwargs) -> bool:
+    """
+    Telegram'ga xabar yuborishni xavfsiz bajaruvchi yordamchi.
+    Tarmoqdagi vaqtinchalik xatolar (TimedOut, RetryAfter, NetworkError)
+    bo'lsa, bir necha marta qayta urinadi.
+    """
+    for attempt in range(1, retries + 1):
+        try:
+            await bot.send_message(chat_id=chat_id, text=text, **kwargs)
+            return True
+        except Forbidden:
+            # foydalanuvchi botni bloklagan
+            return False
+        except RetryAfter as e:
+            # Telegram "keyinroq urin" deganda
+            delay = int(getattr(e, "retry_after", 5)) + 1
+            await asyncio.sleep(delay)
+        except (TimedOut, NetworkError):
+            # vaqtinchalik tarmoq muammosi, biroz kutib qayta urinib ko'ramiz
+            if attempt == retries:
+                return False
+            await asyncio.sleep(2 * attempt)
+        except Exception:
+            # boshqa xatolarni ko'tarib yuboramiz, stack trace loglarda ko'rinishi uchun
+            raise
 
 
 async def watcher_job(context: ContextTypes.DEFAULT_TYPE):
+    # timezone-aware bo'lsin, keyin utc datetime bilan ayirishda xato bermaydi
+    start_ts = datetime.now(timezone.utc)
+    MAX_RUN_SECONDS = int(os.getenv("WATCHER_MAX_RUN_SECONDS", "80"))
     watches = await list_enabled_watches(DB_PATH)
     if not watches:
         return
     
     bot = context.application.bot
     for w in watches:
+
+         # ✅ Time budget: juda cho‘zilib ketmasin
+        if (datetime.now(timezone.utc) - start_ts).total_seconds() > MAX_RUN_SECONDS:
+            print("[watcher_job] time budget reached, will continue next tick")
+            break
         chat_id = int(w["chat_id"])
 
         lang = (
             context.application.chat_data.get(chat_id, {}).get("lang")
+            or w.get("lang")
             or await get_user_lang(DB_PATH, chat_id)
             or "uz"
         )
@@ -2521,6 +2551,10 @@ async def watcher_job(context: ContextTypes.DEFAULT_TYPE):
 
 
         for d in iter_dates(d_from, d_to):
+             # ✅ Time budget: bir user sanalari ham cho‘zsa — shu yerdan chiqib ketamiz
+            if (datetime.now(timezone.utc) - start_ts).total_seconds() > MAX_RUN_SECONDS:
+                print(f"[watcher_job] time budget reached mid-user chat_id={chat_id}, will continue next tick")
+                break
             try:
                 async with WATCH_SEM:
                     api = await fetch_trains(dep_code, arv_code, d, lang=lang)
