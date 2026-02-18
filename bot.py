@@ -32,7 +32,7 @@ DB_PATH = os.getenv("DB_PATH", "bot.db").strip()
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "120"))
 MAX_TG = 3900  # 4096 dan biroz past (xavfsiz)
 ADMIN_IDS = {6655680807}
-LANDING_BASE = "https://uzrail-watch-bot-production.up.railway.app/go"
+LANDING_BASE = "https://uzrail-landing-production.up.railway.app/go"
 
 
 async def send_long_text(update, text: str, *, chunk_size: int = MAX_TG, reply_markup=None):
