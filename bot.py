@@ -32,6 +32,7 @@ DB_PATH = os.getenv("DB_PATH", "bot.db").strip()
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "120"))
 MAX_TG = 3900  # 4096 dan biroz past (xavfsiz)
 ADMIN_IDS = {6655680807}
+LANDING_BASE = "https://uzrail-watch-bot-production.up.railway.app/go"
 
 
 async def send_long_text(update, text: str, *, chunk_size: int = MAX_TG, reply_markup=None):
@@ -51,13 +52,13 @@ async def send_long_text(update, text: str, *, chunk_size: int = MAX_TG, reply_m
         else:
             await msg.reply_text(part)
 
-def buy_ticket_kb(lang: str):
+def buy_ticket_kb(lang: str, dep_code: str, arv_code: str, date_iso: str):
     lang = (lang or "uz").lower()
     if lang not in ("uz", "ru", "en"):
         lang = "uz"
 
-    # ✅ ilova bo'lsa app-link orqali ilovaga o'tishi mumkin, bo'lmasa web ochiladi
-    url = f"https://eticket.railway.uz/{lang}/home"
+    # landing page link: bot paramlarni beradi
+    url = f"{LANDING_BASE}?lang={lang}&dep={dep_code}&arv={arv_code}&date={date_iso}"
 
     label = {
         "uz": "🎫 Bilet sotib olish",
@@ -1753,7 +1754,7 @@ async def now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 1️⃣ asosiy matn + 🎫 bilet tugmasi
     await update.effective_message.reply_text(
         full_text[:3900],
-        reply_markup=buy_ticket_kb(lang)
+        reply_markup=buy_ticket_kb(lang, dep_code, arv_code, d)
     )
 
     # # 2️⃣ alohida xabar bilan /now /stop
@@ -2414,7 +2415,7 @@ async def search_in_range_and_show(update, context):
         snapshot[d] = api
 
     # ✅ faqat 1 marta yuboramiz
-    await send_long_text(update, full_text, reply_markup=buy_ticket_kb(lang))
+    await send_long_text(update, full_text, reply_markup=buy_ticket_kb(lang, dep_code, arv_code, d))
 
     # ✅ DB'ga watch konfiguratsiya + snapshot saqlaymiz
     chat_id = update.effective_chat.id
@@ -2600,7 +2601,7 @@ async def watcher_job(context: ContextTypes.DEFAULT_TYPE):
                         bot,
                         chat_id,
                         text[i:i + 3900],
-                        reply_markup=buy_ticket_kb(lang) if i == 0 else None,
+                        reply_markup=buy_ticket_kb(lang, dep_code, arv_code, d) if i == 0 else None,
                     )
                     if not ok:
                         # user botni bloklagan -> watchni o‘chirib qo‘yamiz, job qayta urunib yurmasin
