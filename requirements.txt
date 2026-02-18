@@ -5,3 +5,4 @@ python-telegram-bot[webhooks]==21.10
 python-telegram-bot[webhooks,job-queue]==21.10
 asyncpg==0.29.0
 flask
+gunicorn
