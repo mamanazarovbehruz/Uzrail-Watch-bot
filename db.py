@@ -2,7 +2,6 @@
 import os
 import asyncpg
 from datetime import datetime, timezone
-from urllib.parse import quote_plus
 
 _POOL: asyncpg.Pool | None = None
 
@@ -245,10 +244,21 @@ async def list_enabled_watches(db_path: str):
     async with pool.acquire() as con:
         rows = await con.fetch(
             """
-            SELECT chat_id, enabled, dep_code, arv_code, dep_name, arv_name,
-                   date_from, date_to, snapshot_json, snapshot_hash
-            FROM watches
-            WHERE enabled=TRUE
+            SELECT
+              w.chat_id,
+              w.enabled,
+              w.dep_code,
+              w.arv_code,
+              w.dep_name,
+              w.arv_name,
+              w.date_from,
+              w.date_to,
+              w.snapshot_json,
+              w.snapshot_hash,
+              u.lang
+            FROM watches AS w
+            LEFT JOIN users AS u ON u.chat_id = w.chat_id
+            WHERE w.enabled = TRUE
             """
         )
         out = []
@@ -264,6 +274,7 @@ async def list_enabled_watches(db_path: str):
                 "date_to": r["date_to"],
                 "snapshot_json": r["snapshot_json"],
                 "snapshot_hash": r["snapshot_hash"],
+                "lang": r["lang"],
             })
         return out
 
