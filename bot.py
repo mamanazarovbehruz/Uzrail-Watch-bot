@@ -52,13 +52,14 @@ async def send_long_text(update, text: str, *, chunk_size: int = MAX_TG, reply_m
         else:
             await msg.reply_text(part)
 
-def buy_ticket_kb(lang: str, dep_code: str, arv_code: str, date_iso: str):
+def buy_ticket_kb(lang: str, dep_code: str, arv_code: str, date_iso: str, dep_name: str, arv_name: str):
     lang = (lang or "uz").lower()
     if lang not in ("uz", "ru", "en"):
         lang = "uz"
 
     # landing page link: bot paramlarni beradi
-    url = f"{LANDING_BASE}?lang={lang}&dep={dep_code}&arv={arv_code}&date={date_iso}"
+    url = f"{LANDING_BASE}?lang={lang}&dep={dep_code}&arv={arv_code}&date={date_iso}" \
+      f"&dep_name={dep_name}&arv_name={arv_name}"
 
     label = {
         "uz": "🎫 Bilet sotib olish",
@@ -1754,7 +1755,7 @@ async def now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 1️⃣ asosiy matn + 🎫 bilet tugmasi
     await update.effective_message.reply_text(
         full_text[:3900],
-        reply_markup=buy_ticket_kb(lang, dep_code, arv_code, d)
+        reply_markup=buy_ticket_kb(lang, dep_code, arv_code, d, dep_name, arv_name)
     )
 
     # # 2️⃣ alohida xabar bilan /now /stop
@@ -2415,7 +2416,7 @@ async def search_in_range_and_show(update, context):
         snapshot[d] = api
 
     # ✅ faqat 1 marta yuboramiz
-    await send_long_text(update, full_text, reply_markup=buy_ticket_kb(lang, dep_code, arv_code, d))
+    await send_long_text(update, full_text, reply_markup=buy_ticket_kb(lang, dep_code, arv_code, d, dep_name, arv_name))
 
     # ✅ DB'ga watch konfiguratsiya + snapshot saqlaymiz
     chat_id = update.effective_chat.id
@@ -2601,7 +2602,7 @@ async def watcher_job(context: ContextTypes.DEFAULT_TYPE):
                         bot,
                         chat_id,
                         text[i:i + 3900],
-                        reply_markup=buy_ticket_kb(lang, dep_code, arv_code, d) if i == 0 else None,
+                        reply_markup=buy_ticket_kb(lang, dep_code, arv_code, d, dep_name, arv_name) if i == 0 else None,
                     )
                     if not ok:
                         # user botni bloklagan -> watchni o‘chirib qo‘yamiz, job qayta urunib yurmasin
