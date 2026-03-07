@@ -631,7 +631,13 @@ def _extract_seats_by_train(api: dict) -> dict:
     """
     out = {}
     try:
-        trains = api.get("data", {}).get("directions", {}).get("forward", {}).get("trains", []) or []
+        trains = (
+            api.get("data", {})
+            .get("directions", {})
+            .get("forward", {})
+            .get("trains", [])
+            or []
+        )
     except Exception:
         trains = []
 
@@ -640,8 +646,27 @@ def _extract_seats_by_train(api: dict) -> dict:
         if not num:
             continue
 
-        dep_name = trn.get("originRoute", {}).get("depStationName") or trn.get("subRoute", {}).get("depStationName") or ""
-        arv_name = trn.get("originRoute", {}).get("arvStationName") or trn.get("subRoute", {}).get("arvStationName") or ""
+        # Asosiy va segment bo'yicha nomlar
+        dep_name = (
+            trn.get("originRoute", {}).get("depStationName")
+            or trn.get("subRoute", {}).get("depStationName")
+            or ""
+        )
+        arv_name = (
+            trn.get("originRoute", {}).get("arvStationName")
+            or trn.get("subRoute", {}).get("arvStationName")
+            or ""
+        )
+
+        full_from = trn.get("originRoute", {}).get("depStationName") or dep_name
+        full_to = trn.get("originRoute", {}).get("arvStationName") or arv_name
+
+        seg_from = trn.get("subRoute", {}).get("depStationName") or dep_name
+        seg_to = trn.get("subRoute", {}).get("arvStationName") or arv_name
+
+        dep_time = trn.get("departureDate")
+        arv_time = trn.get("arrivalDate")
+        way = trn.get("timeOnWay")
 
         cars_map = {}
         for c in (trn.get("cars") or []):
@@ -665,9 +690,24 @@ def _extract_seats_by_train(api: dict) -> dict:
                 up += int(sd.get("lateralUp") or 0)
                 down += int(sd.get("lateralDn") or 0)
 
-            cars_map[ctype] = {"free": free, "tariff": tariff, "up": up, "down": down}
+            cars_map[ctype] = {
+                "free": free,
+                "tariff": tariff,
+                "up": up,
+                "down": down,
+            }
 
-        out[num] = {"meta": {"from": dep_name, "to": arv_name}, "cars": cars_map}
+        meta = {
+            "from": full_from,
+            "to": full_to,
+            "seg_from": seg_from,
+            "seg_to": seg_to,
+            "dep_time": dep_time,
+            "arv_time": arv_time,
+            "way": way,
+        }
+
+        out[num] = {"meta": meta, "cars": cars_map}
 
     return out
 
@@ -769,14 +809,62 @@ def _watch_day_report(old_api: dict, new_api: dict, lang: str) -> str:
     old_map = _extract_seats_by_train(old_api)
     new_map = _extract_seats_by_train(new_api)
 
+    # 🔍 Qo'shimcha meta: yangi API dan to'g'ridan-to'g'ri (format_trains dagidek)
+    extra_meta = {}
+    try:
+        trains = (
+            new_api.get("data", {})
+            .get("directions", {})
+            .get("forward", {})
+            .get("trains", [])
+            or []
+        )
+    except Exception:
+        trains = []
+
+    for trn in trains:
+        num = (trn.get("number") or "").strip()
+        if not num:
+            continue
+
+        full_from = trn.get("originRoute", {}).get("depStationName") or ""
+        full_to = trn.get("originRoute", {}).get("arvStationName") or ""
+        seg_from = trn.get("subRoute", {}).get("depStationName") or full_from
+        seg_to = trn.get("subRoute", {}).get("arvStationName") or full_to
+        dep_time = trn.get("departureDate")
+        arv_time = trn.get("arrivalDate")
+        way = trn.get("timeOnWay")
+
+        extra_meta[num] = {
+            "from": full_from,
+            "to": full_to,
+            "seg_from": seg_from,
+            "seg_to": seg_to,
+            "dep_time": dep_time,
+            "arv_time": arv_time,
+            "way": way,
+        }
+
     out = []
     idx = 0
 
     all_nums = sorted(set(old_map.keys()) | set(new_map.keys()))
     for num in all_nums:
-        meta = ((new_map.get(num) or {}).get("meta") or (old_map.get(num) or {}).get("meta") or {})
-        full_from = meta.get("from", "")
-        full_to = meta.get("to", "")
+        base_meta = (
+            (new_map.get(num) or {}).get("meta")
+            or (old_map.get(num) or {}).get("meta")
+            or {}
+        )
+        em = extra_meta.get(num, {})
+
+        full_from = em.get("from") or base_meta.get("from", "")
+        full_to = em.get("to") or base_meta.get("to", "")
+
+        seg_from = em.get("seg_from") or base_meta.get("seg_from") or full_from
+        seg_to = em.get("seg_to") or base_meta.get("seg_to") or full_to
+        dep_time = em.get("dep_time") or base_meta.get("dep_time") or ""
+        arv_time = em.get("arv_time") or base_meta.get("arv_time") or ""
+        way = em.get("way") or base_meta.get("way") or ""
 
         old_cars = (old_map.get(num) or {}).get("cars", {})
         new_cars = (new_map.get(num) or {}).get("cars", {})
@@ -802,7 +890,15 @@ def _watch_day_report(old_api: dict, new_api: dict, lang: str) -> str:
 
         idx += 1
         out.append(f"🚆 #{idx}:  {num}  {full_from} → {full_to}")
-        out.append(f"{t(lang, "available_place")} {total_now} {t(lang, "item")} {t(lang, "place")}")
+        if seg_from or dep_time:
+            out.append(f"🕒 {seg_from.upper()} / ({dep_time})")
+        if seg_to or arv_time:
+            out.append(f"🕒 {seg_to.upper()} / ({arv_time})")
+        if way:
+            out.append(f"{t(lang, 'traver_duration')} {way}")
+        out.append(
+            f"{t(lang, 'available_place')} {total_now} {t(lang, 'item')} {t(lang, 'place')}"
+        )
 
         all_types = sorted(set(old_cars.keys()) | set(new_cars.keys()))
         for ctype in all_types:
